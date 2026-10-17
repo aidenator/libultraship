@@ -47,6 +47,13 @@ constexpr size_t kVboVertices = kVboBytes / (kVertexFloats * sizeof(float));
 
 constexpr int kFogRampWidth = 256;
 
+// Offscreen framebuffers are textures that hold a 240x400 sideways image, like the screen's
+constexpr int kFbTexWidth = 256;
+constexpr int kFbTexHeight = 512;
+// Framebuffers and textures are both stored bottom-up, so a copied screen goes in the texture's
+// last 400 rows for its rows to line up with the texture's (512 - 400) / 8 tile rows
+constexpr int kCopyTileRowOffset = (kFbTexHeight - kScreenWidth) / 8;
+
 DVLB_s* sShaderDvlb = nullptr;
 shaderProgram_s sShaderProgram;
 
@@ -613,6 +620,9 @@ uint32_t GfxRenderingAPICitro3D::NewTexture() {
 
 void GfxRenderingAPICitro3D::SelectTexture(int tile, uint32_t textureId) {
     mLastSelectedUnit = tile;
+    if (tile == 0) {
+        mBoundFramebuffer = -1;
+    }
     if (tile > 1) {
         return; // mask and blend textures (texture packs) are not supported
     }
@@ -676,6 +686,14 @@ void GfxRenderingAPICitro3D::SetSamplerParameters(int sampler, bool linear_filte
     if (sampler > 1) {
         return;
     }
+    if (sampler == 0 && mBoundFramebuffer >= 0) {
+        C3D_Tex* fbTex = AsTex(mFramebuffers[mBoundFramebuffer].tex);
+        const bool linear = linear_filter && mFilterMode != FILTER_NONE;
+        C3D_TexSetFilter(fbTex, linear ? GPU_LINEAR : GPU_NEAREST, linear ? GPU_LINEAR : GPU_NEAREST);
+        C3D_TexSetWrap(fbTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        C3D_TexBind(0, fbTex);
+        return;
+    }
     Texture& t = mTextures[mBoundTexture[sampler]];
     if (t.tex == nullptr) {
         return;
@@ -703,12 +721,17 @@ void GfxRenderingAPICitro3D::SetZmodeDecal(bool decal) {
 
 void GfxRenderingAPICitro3D::SetViewport(int x, int y, int width, int height) {
     // Screen x runs down the sideways framebuffer, from its far end
-    C3D_SetViewport((u32)y, (u32)(kScreenWidth - x - width), (u32)height, (u32)width);
+    C3D_SetViewport((u32)y, (u32)((int)mTargetWidth - x - width), (u32)height, (u32)width);
 }
 
 void GfxRenderingAPICitro3D::SetScissor(int x, int y, int width, int height) {
-    C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)y, (u32)(kScreenWidth - x - width), (u32)(y + height),
-                   (u32)(kScreenWidth - x));
+    const int w = (int)mTargetWidth;
+    const int h = (int)mTargetHeight;
+    const int left = std::clamp(y, 0, h);
+    const int right = std::clamp(y + height, 0, h);
+    const int top = std::clamp(w - x - width, 0, w);
+    const int bottom = std::clamp(w - x, 0, w);
+    C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)left, (u32)top, (u32)right, (u32)bottom);
 }
 
 void GfxRenderingAPICitro3D::SetUseAlpha(bool useAlpha) {
@@ -791,6 +814,8 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
             tex[t] = &mTextures[mBoundTexture[t]];
         }
     }
+    // A framebuffer bound as texture 0 is sampled in its own sideways layout
+    const Framebuffer* fbTex = (texOff[0] >= 0 && mBoundFramebuffer >= 0) ? &mFramebuffers[mBoundFramebuffer] : nullptr;
 
     float* dst = mVbo + mVboUsed * kVertexFloats;
     for (size_t i = 0; i < numVerts; i++) {
@@ -802,7 +827,13 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
         dst[2] = cc.opt_prim_depth ? -mPrimDepth * w : -(z + w) * 0.5f;
         dst[3] = w;
         for (int t = 0; t < 2; t++) {
-            if (tex[t] != nullptr) {
+            if (t == 0 && fbTex != nullptr) {
+                // Texture coordinates span the framebuffer's game-side size, top-down
+                const float sx = v[texOff[0]] * (float)fbTex->width;
+                const float sy = v[texOff[0] + 1] * (float)fbTex->height;
+                dst[4] = ((float)fbTex->contentHeight - sy) / kFbTexWidth;
+                dst[5] = ((float)fbTex->contentWidth - sx) / kFbTexHeight;
+            } else if (tex[t] != nullptr) {
                 dst[4 + t * 2] = v[texOff[t]] * tex[t]->scaleS;
                 dst[5 + t * 2] = 1.0f - v[texOff[t] + 1] * tex[t]->scaleT;
             } else {
@@ -917,6 +948,7 @@ void GfxRenderingAPICitro3D::Init() {
     // The top screen is 400x240 but its framebuffer is stored rotated, hence 240x400
     mTopTarget = C3D_RenderTargetCreate(kScreenHeight, kScreenWidth, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
     C3D_RenderTargetSetOutput(mTopTarget, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+    mCurrentTarget = mTopTarget;
 
     sShaderDvlb = DVLB_ParseFile((u32*)fast3d_shbin, fast3d_shbin_size);
     shaderProgramInit(&sShaderProgram);
@@ -963,6 +995,9 @@ void GfxRenderingAPICitro3D::OnResize() {
 void GfxRenderingAPICitro3D::StartFrame() {
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C3D_FrameDrawOn(mTopTarget);
+    mCurrentTarget = mTopTarget;
+    mTargetWidth = kScreenWidth;
+    mTargetHeight = kScreenHeight;
     mVboUsed = 0;
     mDrawsSinceSubmit = 0;
 }
@@ -989,19 +1024,82 @@ void GfxRenderingAPICitro3D::FinishRender() {
 }
 
 int GfxRenderingAPICitro3D::CreateFramebuffer() {
-    return mNextFramebufferId++;
+    mFramebuffers.emplace_back();
+    return (int)mFramebuffers.size() - 1;
 }
 
 void GfxRenderingAPICitro3D::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height,
                                                          uint32_t msaa_level, bool opengl_invertY, bool render_target,
                                                          bool has_depth_buffer, bool can_extract_depth) {
+    if (fb_id <= 0 || fb_id >= (int)mFramebuffers.size()) {
+        return; // the screen keeps its size
+    }
+    Framebuffer& fb = mFramebuffers[fb_id];
+    fb.width = width;
+    fb.height = height;
+    if (fb.tex == nullptr) {
+        C3D_Tex* tex = new C3D_Tex();
+        if (!C3D_TexInit(tex, kFbTexWidth, kFbTexHeight, GPU_RGBA8)) {
+            printf("citro3d: out of memory for framebuffer %d\n", fb_id);
+            delete tex;
+            return;
+        }
+        memset(tex->data, 0, tex->size);
+        C3D_TexFlush(tex);
+        C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
+        C3D_TexSetWrap(tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        fb.tex = tex;
+    }
 }
 
 void GfxRenderingAPICitro3D::StartDrawToFramebuffer(int fbId, float noiseScale) {
+    if (fbId <= 0 || fbId >= (int)mFramebuffers.size() || mFramebuffers[fbId].tex == nullptr) {
+        C3D_FrameDrawOn(mTopTarget);
+        mCurrentTarget = mTopTarget;
+        mTargetWidth = kScreenWidth;
+        mTargetHeight = kScreenHeight;
+        return;
+    }
+    Framebuffer& fb = mFramebuffers[fbId];
+    if (fb.target == nullptr) {
+        fb.target = C3D_RenderTargetCreateFromTex(AsTex(fb.tex), GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);
+        if (fb.target == nullptr) {
+            printf("citro3d: cannot draw into framebuffer %d\n", fbId);
+            return;
+        }
+    }
+    C3D_FrameDrawOn(fb.target);
+    mCurrentTarget = fb.target;
+    mTargetWidth = std::min<uint32_t>(fb.width, kFbTexHeight);
+    mTargetHeight = std::min<uint32_t>(fb.height, kFbTexWidth);
+    fb.contentWidth = mTargetWidth;
+    fb.contentHeight = mTargetHeight;
 }
 
 void GfxRenderingAPICitro3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1,
                                              int dstX0, int dstY0, int dstX1, int dstY1) {
+    // The game only copies the screen (pause background, transition snapshot), always whole
+    if (fbSrcId != 0 || fbDstId <= 0 || fbDstId >= (int)mFramebuffers.size() ||
+        mFramebuffers[fbDstId].tex == nullptr) {
+        return;
+    }
+    Framebuffer& fb = mFramebuffers[fbDstId];
+    // The copy engine runs from the GX queue, after anything already submitted: submit the
+    // frame's draws so far first
+    if (mDrawsSinceSubmit != 0) {
+        C3D_FrameSplit(0);
+        mDrawsSinceSubmit = 0;
+    }
+    // Both are 8x8-tiled RGBA8, so copy tile row by tile row: 240 pixels of each 256-wide row
+    C3D_FrameBuf& screen = mTopTarget->frameBuf;
+    const u32 rowBytes = (u32)screen.width * 8 * 4;
+    const u32 texRowBytes = (u32)kFbTexWidth * 8 * 4;
+    u8* dst = (u8*)AsTex(fb.tex)->data + kCopyTileRowOffset * texRowBytes;
+    GX_TextureCopy((u32*)screen.colorBuf, GX_BUFFER_DIM(rowBytes >> 4, 0), (u32*)dst,
+                   GX_BUFFER_DIM(rowBytes >> 4, (texRowBytes - rowBytes) >> 4), rowBytes * (screen.height / 8),
+                   GX_TRANSFER_RAW_COPY(1));
+    fb.contentWidth = kScreenWidth;
+    fb.contentHeight = kScreenHeight;
 }
 
 void GfxRenderingAPICitro3D::ClearFramebuffer(bool color, bool depth) {
@@ -1014,7 +1112,7 @@ void GfxRenderingAPICitro3D::ClearFramebuffer(bool color, bool depth) {
             C3D_FrameSplit(0);
             mDrawsSinceSubmit = 0;
         }
-        C3D_RenderTargetClear(mTopTarget, (C3D_ClearBits)bits, 0x000000FF, 0x00FFFFFF);
+        C3D_RenderTargetClear(mCurrentTarget, (C3D_ClearBits)bits, 0x000000FF, 0x00FFFFFF);
     }
 }
 
@@ -1039,6 +1137,11 @@ void* GfxRenderingAPICitro3D::GetFramebufferTextureId(int fbId) {
 }
 
 void GfxRenderingAPICitro3D::SelectTextureFb(int fbId) {
+    if (fbId <= 0 || fbId >= (int)mFramebuffers.size() || mFramebuffers[fbId].tex == nullptr) {
+        return;
+    }
+    C3D_TexBind(0, AsTex(mFramebuffers[fbId].tex));
+    mBoundFramebuffer = fbId;
 }
 
 void GfxRenderingAPICitro3D::DeleteTexture(uint32_t texId) {

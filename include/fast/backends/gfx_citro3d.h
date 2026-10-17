@@ -127,6 +127,16 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
         float scaleT = 1.0f;
     };
 
+    // An offscreen framebuffer: a 256x512 texture holding an image stored sideways like the screen
+    struct Framebuffer {
+        void* tex = nullptr; // C3D_Tex
+        C3D_RenderTarget_tag* target = nullptr; // created when first drawn into
+        uint32_t width = 0;  // the size the game sees
+        uint32_t height = 0;
+        uint32_t contentWidth = 0; // the size of the image it holds: a copied screen, or its own drawing
+        uint32_t contentHeight = 0;
+    };
+
     const Citro3D::TevProgram& GetTevProgram(ShaderProgram* prg, int primaryRgb, int primaryAlpha);
     void ApplyTevProgram(const Citro3D::TevProgram& program, const float* inputs, bool hasFog, const float* fog);
     void ApplyDepth();
@@ -134,6 +144,11 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void DrawRun(const float* buf, size_t firstTri, size_t numTris, int primaryRgb, int primaryAlpha);
 
     C3D_RenderTarget_tag* mTopTarget = nullptr;
+    C3D_RenderTarget_tag* mCurrentTarget = nullptr;
+    uint32_t mTargetWidth = 400; // logical size of what is being drawn to
+    uint32_t mTargetHeight = 240;
+    std::vector<Framebuffer> mFramebuffers = std::vector<Framebuffer>(1); // 0 is the screen
+    int mBoundFramebuffer = -1; // framebuffer bound as texture 0, if any
     std::vector<ShaderProgram*> mShaders;
     ShaderProgram* mCurrentShader = nullptr;
 
@@ -153,7 +168,6 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     bool mUseAlpha = false;
     float mPrimDepth = 0.0f;
     FilteringMode mFilterMode = FILTER_LINEAR;
-    int mNextFramebufferId = 1; // 0 is the screen
 
     // Statistics, printed every few seconds
     uint32_t mFrameCount = 0;
