@@ -5,6 +5,7 @@
 #include <string>
 #include <stdint.h>
 #include <string>
+#include <condition_variable>
 #include <mutex>
 #include <vector>
 
@@ -78,5 +79,10 @@ class O2rArchive final : virtual public Archive {
     zip_t* mZipArchive;
     std::mutex mPoolMutex;
     std::vector<zip_t*> mZipArchivePool;
+#ifdef __3DS__
+    // Readers share mZipArchive one at a time (see GetZipHandle)
+    std::condition_variable mZipArchiveFree;
+    bool mZipArchiveBusy = false;
+#endif
 };
 } // namespace Ship
