@@ -831,6 +831,7 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
     C3D_DrawArrays(GPU_TRIANGLES, (int)mVboUsed, (int)numVerts);
     mVboUsed += numVerts;
     mFrameDraws++;
+    mDrawsSinceSubmit++;
 }
 
 void GfxRenderingAPICitro3D::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
@@ -963,6 +964,7 @@ void GfxRenderingAPICitro3D::StartFrame() {
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C3D_FrameDrawOn(mTopTarget);
     mVboUsed = 0;
+    mDrawsSinceSubmit = 0;
 }
 
 void GfxRenderingAPICitro3D::EndFrame() {
@@ -1005,6 +1007,13 @@ void GfxRenderingAPICitro3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0
 void GfxRenderingAPICitro3D::ClearFramebuffer(bool color, bool depth) {
     const int bits = (color ? C3D_CLEAR_COLOR : 0) | (depth ? C3D_CLEAR_DEPTH : 0);
     if (bits != 0) {
+        // A clear is a memory fill queued straight to the GPU, while draws wait in the command
+        // list until the frame ends; send them first, or a mid-frame depth clear (before the HUD,
+        // say) lands before the world is drawn
+        if (mDrawsSinceSubmit != 0) {
+            C3D_FrameSplit(0);
+            mDrawsSinceSubmit = 0;
+        }
         C3D_RenderTargetClear(mTopTarget, (C3D_ClearBits)bits, 0x000000FF, 0x00FFFFFF);
     }
 }

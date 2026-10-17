@@ -144,6 +144,7 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
 
     float* mVbo = nullptr; // linear memory, refilled every frame
     size_t mVboUsed = 0;   // vertices
+    uint32_t mDrawsSinceSubmit = 0; // draws still in the command list, not yet sent to the GPU
     bool mVboFullReported = false;
 
     bool mDepthTest = false;
