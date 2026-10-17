@@ -39,5 +39,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "graphic/Fast3D/backends/gfx_opengl*")
 endif()
 
+# The 3DS has its own window and rendering backends and no OpenGL; they are its only backends
+if (CMAKE_SYSTEM_NAME STREQUAL "Nintendo3DS")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_(opengl|sdl2)\\.cpp$")
+else()
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_(3ds|citro3d)\\.cpp$")
+endif()
+
 source_group("graphic" FILES ${Source_Files__Graphic})
 target_sources(libultraship PRIVATE ${Source_Files__Graphic})

@@ -12,6 +12,8 @@
 #include "fast/backends/gfx_direct3d_common.h"
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
+#include "fast/backends/gfx_3ds.h"
+#include "fast/backends/gfx_citro3d.h"
 
 #include "fast/Fast3dGui.h"
 
@@ -36,7 +38,11 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
         AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_METAL);
     }
 #endif
+#ifdef __3DS__
+    AddAvailableWindowBackend(WindowBackend::FAST3D_3DS_CITRO3D);
+#else
     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -153,6 +159,12 @@ void Fast3dWindow::InitWindowManager() {
         case WindowBackend::FAST3D_SDL_METAL:
             mRenderingApi = new GfxRenderingAPIMetal();
             mWindowManagerApi = new GfxWindowBackendSDL2();
+            break;
+#endif
+#ifdef __3DS__
+        case WindowBackend::FAST3D_3DS_CITRO3D:
+            mRenderingApi = new GfxRenderingAPICitro3D();
+            mWindowManagerApi = new GfxWindowBackend3DS();
             break;
 #endif
         default:

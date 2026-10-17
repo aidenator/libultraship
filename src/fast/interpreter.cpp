@@ -7,7 +7,12 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
-#ifndef _WIN32
+#if defined(__3DS__)
+// Not <3ds/os.h>: its osGetTime() clashes with libultra's
+extern "C" char __start__[], __end__[];  // program image bounds from the 3dsx linker script
+extern "C" uint32_t __ctru_heap_size;     // application heap size, set by libctru at startup
+static constexpr uintptr_t kCtrHeapBegin = 0x08000000; // OS_HEAP_AREA_BEGIN
+#elif !defined(_WIN32)
 #include <dlfcn.h>
 #endif
 
@@ -3974,6 +3979,13 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
     HMODULE module = nullptr;
     return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                               reinterpret_cast<LPCSTR>(addr), &module) != 0;
+#elif defined(__3DS__)
+    // The 3DS loads the program at 0x00100000 and its heap from 0x08000000, both inside the
+    // segmented range, so real pointers there are normal. Accept the program image and the heap.
+    if (addr >= (uintptr_t)__start__ && addr < (uintptr_t)__end__) {
+        return true;
+    }
+    return addr >= kCtrHeapBegin && addr < kCtrHeapBegin + __ctru_heap_size;
 #else
     // For non-Windows platforms, check whether the address belongs to a loaded object.
     Dl_info info;

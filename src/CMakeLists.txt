@@ -213,6 +213,15 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
         )
     endif()
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Nintendo3DS")
+    target_compile_definitions(libultraship PRIVATE
+        $<$<CONFIG:Debug>:_DEBUG>
+        $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+        SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
+    )
+    target_link_libraries(libultraship PUBLIC citro3d ctru)
+    # Raise the 32 KB default thread stack (see __wrap_pthread_create in gfx_3ds.cpp)
+    target_link_options(libultraship INTERFACE -Wl,--wrap=pthread_create)
 else()
     target_compile_definitions(libultraship PRIVATE
         ENABLE_OPENGL

@@ -210,6 +210,16 @@ const char* ArchiveManager::HashToCString(uint64_t hash) const {
     return hashStr != nullptr ? hashStr->c_str() : nullptr;
 }
 
+// libstdc++ on the 3DS does not treat device paths such as "sdmc:/..." as absolute, so
+// std::filesystem::absolute() would prefix the working directory and break them.
+static std::string AbsoluteArchivePath(const std::filesystem::path& path) {
+#ifdef __3DS__
+    return path.string();
+#else
+    return std::filesystem::absolute(path).string();
+#endif
+}
+
 std::vector<std::string> ArchiveManager::GetArchiveListInPaths(const std::vector<std::string>& archivePaths) {
     std::vector<std::string> fileList = {};
 
@@ -222,18 +232,18 @@ std::vector<std::string> ArchiveManager::GetArchiveListInPaths(const std::vector
                         StringHelper::IEquals(p.path().extension().string(), ".zip") ||
                         StringHelper::IEquals(p.path().extension().string(), ".mpq") ||
                         StringHelper::IEquals(p.path().extension().string(), ".o2r")) {
-                        fileList.push_back(std::filesystem::absolute(p).string());
+                        fileList.push_back(AbsoluteArchivePath(p));
                         hasAssetFiles = true;
                     }
                 }
 
                 if (!hasAssetFiles) {
-                    fileList.push_back(std::filesystem::absolute(archivePath).string());
+                    fileList.push_back(AbsoluteArchivePath(archivePath));
                 }
             } else if (std::filesystem::is_regular_file(archivePath)) {
-                fileList.push_back(std::filesystem::absolute(archivePath).string());
+                fileList.push_back(AbsoluteArchivePath(archivePath));
             } else {
-                SPDLOG_WARN("The archive at path {} does not exist", std::filesystem::absolute(archivePath).string());
+                SPDLOG_WARN("The archive at path {} does not exist", AbsoluteArchivePath(archivePath));
             }
         } else {
             SPDLOG_WARN("No archive path supplied");

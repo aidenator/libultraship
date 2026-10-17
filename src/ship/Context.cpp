@@ -478,6 +478,11 @@ std::string Context::GetShortName() const {
 }
 
 std::string Context::GetAppBundlePath() {
+#ifdef __3DS__
+    // Homebrew can start with any working directory, so use a fixed folder on the SD card
+    return "sdmc:/3ds/lighthouse";
+#endif
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -541,6 +546,11 @@ std::string Context::GetAppBundlePath() {
 }
 
 std::string Context::GetAppDirectoryPath(const std::string& appName) {
+#ifdef __3DS__
+    // Homebrew can start with any working directory, so use a fixed folder on the SD card
+    return "sdmc:/3ds/lighthouse";
+#endif
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {

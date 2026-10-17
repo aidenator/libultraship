@@ -68,6 +68,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     include(cmake/dependencies/openbsd.cmake)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Nintendo3DS")
+    include(cmake/dependencies/nintendo3ds.cmake)
+endif()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     include(cmake/dependencies/windows.cmake)
 endif()

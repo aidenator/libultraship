@@ -27,6 +27,8 @@
 #ifdef ENABLE_OPENGL
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl2.h>
+#elif defined(__3DS__)
+#include <imgui_impl_sdl2.h> // referenced by the SDL window cases below, never called headless
 #endif
 
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
