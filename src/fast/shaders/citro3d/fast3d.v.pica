@@ -1,0 +1,24 @@
+; Fast3D vertex shader for the 3DS: the interpreter transforms and lights vertices on the CPU,
+; so this only passes them through. The renderer has already rotated positions for the
+; sideways-mounted top screen.
+
+.out outpos position
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+.out outtc2 texcoord2
+.out outclr color
+
+.alias inpos v0
+.alias intc0 v1
+.alias intc1 v2
+.alias intc2 v3
+.alias inclr v4
+
+.proc main
+	mov outpos, inpos
+	mov outtc0, intc0
+	mov outtc1, intc1
+	mov outtc2, intc2
+	mov outclr, inclr
+	end
+.end

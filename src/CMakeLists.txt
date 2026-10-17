@@ -220,6 +220,12 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Nintendo3DS")
         SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
     )
     target_link_libraries(libultraship PUBLIC citro3d ctru)
+    # The citro3d renderer's pass-through vertex shader, embedded as fast3d_shbin.h
+    enable_language(ASM)
+    ctr_add_shader_library(fast3d_shader ${CMAKE_CURRENT_SOURCE_DIR}/fast/shaders/citro3d/fast3d.v.pica
+                           OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/fast3d.shbin)
+    dkp_add_embedded_binary_library(fast3d_shader_bin fast3d_shader)
+    target_link_libraries(libultraship PRIVATE fast3d_shader_bin)
     # Raise the 32 KB default thread stack (see __wrap_pthread_create in gfx_3ds.cpp)
     target_link_options(libultraship INTERFACE -Wl,--wrap=pthread_create)
 else()

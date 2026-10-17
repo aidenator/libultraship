@@ -4,25 +4,73 @@
 #include "gfx_rendering_api.h"
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 #include <imgui.h>
+
+#include "fast/interpreter.h"
 
 struct C3D_RenderTarget_tag;
 
 namespace Fast {
 
+namespace Citro3D {
+
+// A value the combiner reads, after the formula has been split into TEV stages
+enum class Src : uint8_t { Const, Primary, Tex0, Tex1, Tex2, Prev, Buffer, Combined };
+
+struct Operand {
+    Src src = Src::Prev;
+    bool alpha = false;    // read the source's alpha (replicated into RGB for colour stages)
+    bool oneMinus = false; // 1 - value
+    int16_t constExpr = -1; // for Src::Const: index into TevProgram::constExprs
+};
+
+// One channel (colour or alpha) of a TEV stage
+struct ChannelStage {
+    uint8_t func = 0; // GPU_COMBINEFUNC
+    Operand ops[3];
+    uint8_t numOps = 1;
+    bool updateBuffer = false;
+};
+
+// A constant the CPU works out per draw: the N64 combiner inputs that stay the same across a
+// batch (prim and env colour, usually) and anything built only from them
+struct ConstExpr {
+    enum class Op : uint8_t { Leaf, Mul, Add, Sub, OneMinus } op = Op::Leaf;
+    uint8_t item = 0;  // Leaf: SHADER_* item
+    bool alpha = false; // Leaf: read the input's alpha
+    int16_t a = -1, b = -1;
+};
+
+struct TevProgram {
+    std::vector<ChannelStage> rgb;
+    std::vector<ChannelStage> alpha; // same length as rgb
+    std::vector<ConstExpr> constExprs;
+};
+
+} // namespace Citro3D
+
 struct ShaderProgram {
     uint64_t shaderId0;
     uint64_t shaderId1;
+    CCFeatures cc;
     uint8_t numInputs;
     bool usedTextures[2];
+    bool inputUsedRgb[7];
+    bool inputUsedAlpha[7];
+    uint8_t numFloats; // per vertex in the interpreter's buffer
+    // Compiled TEV programs, keyed by which input (if any) arrives as the per-vertex colour
+    std::unordered_map<uint32_t, Citro3D::TevProgram> programs;
 };
 
 /**
- * @brief Rendering backend for the 3DS GPU through citro3d.
+ * @brief Rendering backend for the 3DS GPU (PICA200) through citro3d.
  *
- * Bring-up stage: frames are begun, cleared and presented on the top screen, but triangles are
- * only counted, not drawn. Per-frame statistics are printed to the bottom-screen console.
+ * Fast3D transforms and lights vertices on the CPU, so the vertex shader only passes them
+ * through. Each N64 colour combiner is translated into fixed-function TEV stages: combiner
+ * inputs that stay constant across a draw (usually prim and env colour) become stage constants,
+ * and the one that varies (usually shade) becomes the vertex colour.
  */
 class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
   public:
@@ -73,14 +121,40 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void SetCurrentPrimDepth(float depth) override;
 
   private:
+    struct Texture {
+        void* tex = nullptr; // C3D_Tex, an anonymous struct that cannot be forward-declared
+        float scaleS = 1.0f; // the image's share of the power-of-two texture it was padded into
+        float scaleT = 1.0f;
+    };
+
+    const Citro3D::TevProgram& GetTevProgram(ShaderProgram* prg, int primaryRgb, int primaryAlpha);
+    void ApplyTevProgram(const Citro3D::TevProgram& program, const float* inputs, bool hasFog, const float* fog);
+    void ApplyDepth();
+    void ApplyBlendAndAlphaTest();
+    void DrawRun(const float* buf, size_t firstTri, size_t numTris, int primaryRgb, int primaryAlpha);
+
     C3D_RenderTarget_tag* mTopTarget = nullptr;
     std::vector<ShaderProgram*> mShaders;
     ShaderProgram* mCurrentShader = nullptr;
-    uint32_t mNextTextureId = 0;
-    int mNextFramebufferId = 1; // 0 is the screen
-    FilteringMode mFilterMode = FILTER_LINEAR;
 
-    // Bring-up statistics, printed every few seconds
+    std::vector<Texture> mTextures;
+    uint32_t mBoundTexture[2] = { 0, 0 };
+    int mLastSelectedUnit = 0;
+    void* mFogRamp = nullptr; // C3D_Tex
+
+    float* mVbo = nullptr; // linear memory, refilled every frame
+    size_t mVboUsed = 0;   // vertices
+    bool mVboFullReported = false;
+
+    bool mDepthTest = false;
+    bool mDepthMask = true;
+    bool mDecal = false;
+    bool mUseAlpha = false;
+    float mPrimDepth = 0.0f;
+    FilteringMode mFilterMode = FILTER_LINEAR;
+    int mNextFramebufferId = 1; // 0 is the screen
+
+    // Statistics, printed every few seconds
     uint32_t mFrameCount = 0;
     uint32_t mFrameTris = 0;
     uint32_t mFrameDraws = 0;
