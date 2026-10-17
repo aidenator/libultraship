@@ -143,6 +143,18 @@ endif()
 
 target_compile_definitions(libultraship PRIVATE ${GBI_UCODE})
 
+# The ImGui context exists (for code that queries it) but no backend is initialised and no frame
+# is drawn; the game renders straight to the window.
+option(LUS_HEADLESS_GUI "Never render ImGui; draw the game directly to the window" OFF)
+if(LUS_HEADLESS_GUI)
+    target_compile_definitions(libultraship PUBLIC LUS_HEADLESS_GUI)
+endif()
+
+set(LUS_LOG_QUEUE_SIZE "" CACHE STRING "Async log queue length (empty keeps the default of 8192)")
+if(LUS_LOG_QUEUE_SIZE)
+    target_compile_definitions(libultraship PRIVATE LUS_LOG_QUEUE_SIZE=${LUS_LOG_QUEUE_SIZE})
+endif()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         WIN32

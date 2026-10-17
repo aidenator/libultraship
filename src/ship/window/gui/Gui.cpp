@@ -315,6 +315,11 @@ void Gui::CheckSaveCvars() {
 }
 
 void Gui::StartDraw() {
+#ifdef LUS_HEADLESS_GUI
+    // No ImGui frame: only size the game viewport so the game draws straight to the window.
+    CalculateGameViewport();
+    return;
+#endif
     // Initialize the frame.
     StartFrame();
     // Draw the gui menus
@@ -324,6 +329,10 @@ void Gui::StartDraw() {
 }
 
 void Gui::EndDraw() {
+#ifdef LUS_HEADLESS_GUI
+    CheckSaveCvars();
+    return;
+#endif
     // Draw the game framebuffer into ImGui
     DrawGame();
     // End the frame

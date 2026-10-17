@@ -51,6 +51,9 @@ void Fast3dGui::Init(GuiWindowInitData windowImpl) {
 }
 
 bool Fast3dGui::SupportsViewports() {
+#ifdef LUS_HEADLESS_GUI
+    return false;
+#endif
 #ifdef __linux__
     const char* currentDesktop = std::getenv("XDG_CURRENT_DESKTOP");
     if (currentDesktop && std::string(currentDesktop) == "gamescope") {
@@ -66,6 +69,9 @@ bool Fast3dGui::SupportsViewports() {
 }
 
 void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
@@ -86,6 +92,9 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
 }
 
 void Fast3dGui::ImGuiWMInit() {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
             SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
@@ -117,6 +126,9 @@ void Fast3dGui::ImGuiWMInit() {
 }
 
 void Fast3dGui::ImGuiWMShutdown() {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -141,6 +153,9 @@ void Fast3dGui::ImGuiWMShutdown() {
 void Fast3dGui::ImGuiBackendInit() {
     auto window = Ship::Context::GetRawInstance()->GetWindow();
     mInterpreter = std::dynamic_pointer_cast<Fast3dWindow>(window)->GetInterpreterWeak();
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -174,6 +189,9 @@ void Fast3dGui::ImGuiBackendInit() {
 }
 
 void Fast3dGui::ImGuiBackendShutdown() {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -196,6 +214,9 @@ void Fast3dGui::ImGuiBackendShutdown() {
 }
 
 void Fast3dGui::ImGuiBackendNewFrame() {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -222,6 +243,9 @@ void Fast3dGui::ImGuiBackendNewFrame() {
 }
 
 void Fast3dGui::ImGuiWMNewFrame() {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
@@ -240,6 +264,9 @@ void Fast3dGui::ImGuiWMNewFrame() {
 // Bind ImGui's SDL2 gamepad backend to the controller(s) the
 // ControlDeck has already opened
 void Fast3dGui::RefreshImGuiGamepads() {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     if (mImpl.Backend != WindowBackend::FAST3D_SDL_OPENGL && mImpl.Backend != WindowBackend::FAST3D_SDL_METAL) {
         return;
     }
@@ -248,6 +275,9 @@ void Fast3dGui::RefreshImGuiGamepads() {
 }
 
 void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -274,6 +304,9 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 }
 
 void Fast3dGui::DrawFloatingWindows() {
+#ifdef LUS_HEADLESS_GUI
+    return;
+#endif
     if (!(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)) {
         return;
     }
@@ -304,6 +337,22 @@ void Fast3dGui::DrawFloatingWindows() {
 }
 
 void Fast3dGui::CalculateGameViewport() {
+#ifdef LUS_HEADLESS_GUI
+    // The game fills the window at window resolution. Nothing would draw an offscreen game framebuffer,
+    // so the render size must equal the viewport (no internal scaling or low-res modes) for the
+    // interpreter to render straight to the window.
+    {
+        auto window = Ship::Context::GetRawInstance()->GetWindow();
+        const auto interpreter = mInterpreter.lock().get();
+        interpreter->mGameWindowViewport.x = 0;
+        interpreter->mGameWindowViewport.y = 0;
+        interpreter->mGameWindowViewport.width = (int16_t)window->GetWidth();
+        interpreter->mGameWindowViewport.height = (int16_t)window->GetHeight();
+        interpreter->mCurDimensions.width = window->GetWidth();
+        interpreter->mCurDimensions.height = window->GetHeight();
+        return;
+    }
+#endif
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);

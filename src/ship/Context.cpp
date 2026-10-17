@@ -29,6 +29,10 @@
 #include <pwd.h>
 #endif
 
+#ifndef LUS_LOG_QUEUE_SIZE
+#define LUS_LOG_QUEUE_SIZE 8192 // async log messages buffered before writers block
+#endif
+
 namespace Ship {
 std::unique_ptr<Context> Context::mContext;
 
@@ -125,7 +129,7 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
 
     try {
         // Setup Logging
-        spdlog::init_thread_pool(8192, 1);
+        spdlog::init_thread_pool(LUS_LOG_QUEUE_SIZE, 1);
         std::vector<spdlog::sink_ptr> sinks;
 
 #if (!defined(_WIN32)) || defined(_DEBUG)
@@ -173,7 +177,7 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         GetLogger()->set_level(debugBuildLogLevel);
         GetLogger()->flush_on(spdlog::level::trace);
 #else
-        mLogThreadPool = std::make_shared<spdlog::details::thread_pool>(8192, 1);
+        mLogThreadPool = std::make_shared<spdlog::details::thread_pool>(LUS_LOG_QUEUE_SIZE, 1);
         mLogger = std::make_shared<spdlog::async_logger>(GetName(), sinks.begin(), sinks.end(), mLogThreadPool,
                                                          spdlog::async_overflow_policy::block);
         GetLogger()->set_level(releaseBuildLogLevel);
