@@ -4,6 +4,7 @@
 #include "ship/window/Window.h"
 #include "spdlog/spdlog.h"
 #include <unordered_map>
+#include <chrono>
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -223,7 +224,23 @@ std::shared_ptr<File> O2rArchive::LoadFile(uint64_t hash) {
     return LoadFile(filePath);
 }
 
+std::atomic<uint32_t> O2rArchive::sFilesRead = 0;
+std::atomic<uint64_t> O2rArchive::sReadMicroseconds = 0;
+
+namespace {
+struct ReadTimer {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~ReadTimer() {
+        const auto us =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+        O2rArchive::sReadMicroseconds += (uint64_t)us;
+        O2rArchive::sFilesRead++;
+    }
+};
+} // namespace
+
 std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
+    ReadTimer timer;
     zip_t* zipArchive = GetZipHandle();
     if (zipArchive == nullptr) {
         SPDLOG_TRACE("Failed to open file {} from zip archive {}. Archive not open.", filePath, GetPath());

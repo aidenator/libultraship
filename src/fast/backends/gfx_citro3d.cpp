@@ -17,6 +17,7 @@
 
 #include "fast/lus_gbi.h"
 #include "fast3d_shbin.h"
+#include "ship/resource/archive/O2rArchive.h"
 
 // Render the RGBA8 target into the RGB8 screen framebuffer without scaling
 #define DISPLAY_TRANSFER_FLAGS                                                                                    \
@@ -31,6 +32,7 @@ using namespace Citro3D;
 namespace {
 
 constexpr double kStatsIntervalSeconds = 3.0;
+constexpr double kSlowFrameMs = 70.0; // the game runs at 20 to 30 fps, 50 ms at worst
 constexpr int kMaxTevStages = 6;
 constexpr int kMaxBufferUpdateStage = 3; // only stages 0-3 can write the combiner buffer
 constexpr uint8_t kFogItem = 0xFE;      // ConstExpr leaf for the fog colour
@@ -634,6 +636,14 @@ void GfxRenderingAPICitro3D::SelectTexture(int tile, uint32_t textureId) {
 
 void GfxRenderingAPICitro3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
     mFrameUploads++;
+    const uint64_t uploadStart = svcGetSystemTick();
+    struct AddTicks {
+        uint64_t& total;
+        uint64_t start;
+        ~AddTicks() {
+            total += svcGetSystemTick() - start;
+        }
+    } addTicks{ mUploadTicks, uploadStart };
     if (mLastSelectedUnit > 1 || width == 0 || height == 0) {
         return;
     }
@@ -993,6 +1003,7 @@ void GfxRenderingAPICitro3D::OnResize() {
 }
 
 void GfxRenderingAPICitro3D::StartFrame() {
+    mFrameStartTick = svcGetSystemTick();
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C3D_FrameDrawOn(mTopTarget);
     mCurrentTarget = mTopTarget;
@@ -1007,6 +1018,26 @@ void GfxRenderingAPICitro3D::EndFrame() {
 
     mFrameCount++;
     const uint64_t now = svcGetSystemTick();
+
+    // Report a slow frame: how long since the last one, how much of it went to drawing (from
+    // StartFrame, which includes waiting for the previous frame's GPU work), and what loading
+    // happened in between, on any thread
+    const uint32_t filesRead = Ship::O2rArchive::sFilesRead.load();
+    const uint64_t readMicros = Ship::O2rArchive::sReadMicroseconds.load();
+    if (mLastFrameEndTick != 0) {
+        const double toMs = 1000.0 / SYSCLOCK_ARM11;
+        const double frameMs = (double)(now - mLastFrameEndTick) * toMs;
+        if (frameMs > kSlowFrameMs) {
+            printf("slow frame: %.0f ms (draw %.0f, gpu %.1f), %lu files read in %.0f ms, %lu uploads in %.0f ms\n",
+                   frameMs, (double)(now - mFrameStartTick) * toMs, C3D_GetDrawingTime(),
+                   (unsigned long)(filesRead - mFilesReadAtFrameEnd), (readMicros - mReadMicrosAtFrameEnd) / 1000.0,
+                   (unsigned long)mFrameUploads, (double)mUploadTicks * toMs);
+        }
+    }
+    mLastFrameEndTick = now;
+    mFilesReadAtFrameEnd = filesRead;
+    mReadMicrosAtFrameEnd = readMicros;
+    mUploadTicks = 0;
     const double elapsed = (double)(now - mStatsTick) / SYSCLOCK_ARM11;
     if (elapsed >= kStatsIntervalSeconds) {
         printf("frame %lu: %.1f fps, %lu draws, %lu tris, %lu uploads/frame, gpu %.1f ms\n",

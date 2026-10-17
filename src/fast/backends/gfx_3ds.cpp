@@ -3,7 +3,6 @@
 #include "fast/backends/gfx_3ds.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <malloc.h>
 
 // The build renames libultra's osGetTime; lift that while libctru declares its own
@@ -80,10 +79,6 @@ void GfxWindowBackend3DS::Init(const char* gameName, const char* apiName, bool s
 
     // The SDL backend does this too: it creates the ImGui context and links the GUI to the
     // interpreter. On the 3DS the GUI is headless, so no window handles are needed.
-    // SDL stops the 3DS sound service (NDSP) only in SDL_Quit. Left running, its thread can run
-    // once more while the exiting program's memory is released, and crash on its own stack.
-    atexit(SDL_Quit);
-
     GuiWindowInitData windowImpl = {};
     windowImpl.Backend = WindowBackend::FAST3D_3DS_CITRO3D;
     std::dynamic_pointer_cast<Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui())->Init(windowImpl);
@@ -224,6 +219,8 @@ bool GfxWindowBackend3DS::IsRunning() {
 }
 
 void GfxWindowBackend3DS::Destroy() {
+    // SDL stops its audio thread and the 3DS sound service (NDSP) only here. Left running, they
+    // can run once more while the exiting program's memory is released, and crash on their stacks.
     SDL_Quit();
     gfxExit();
 }

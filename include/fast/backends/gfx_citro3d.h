@@ -175,6 +175,13 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     uint32_t mFrameDraws = 0;
     uint32_t mFrameUploads = 0;
     uint64_t mStatsTick = 0;
+
+    // Slow-frame report: one line for any frame that takes much longer than the game's rate
+    uint64_t mFrameStartTick = 0;
+    uint64_t mLastFrameEndTick = 0;
+    uint64_t mUploadTicks = 0;
+    uint32_t mFilesReadAtFrameEnd = 0;
+    uint64_t mReadMicrosAtFrameEnd = 0;
 };
 
 } // namespace Fast

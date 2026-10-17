@@ -5,6 +5,7 @@
 #include <string>
 #include <stdint.h>
 #include <string>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <vector>
@@ -36,6 +37,10 @@ class O2rArchive final : virtual public Archive {
      */
     O2rArchive(const std::string& archivePath);
     ~O2rArchive();
+
+    /** @brief Files read from any O2rArchive so far, and the time spent reading them (for profiling). */
+    static std::atomic<uint32_t> sFilesRead;
+    static std::atomic<uint64_t> sReadMicroseconds;
 
     /**
      * @brief Opens the ZIP file via libzip, creating the internal handle pool.
