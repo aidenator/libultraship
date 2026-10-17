@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -94,6 +95,11 @@ class ResourceManager {
 
   public:
     ResourceManager();
+
+    /** @brief Resources loaded (not served from the cache) so far, and the time spent reading and
+     * converting them (for profiling). */
+    static std::atomic<uint32_t> sResourcesLoaded;
+    static std::atomic<uint64_t> sLoadMicroseconds;
 
     /**
      * @brief Initializes the ResourceManager, mounting archives and starting the thread pool.

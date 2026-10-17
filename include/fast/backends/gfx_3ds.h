@@ -6,6 +6,16 @@
 namespace Fast {
 
 /**
+ * @brief Starts entry(arg) on another CPU core, at the calling thread's priority.
+ *
+ * Every pthread (and so every std::thread) runs on the app's main core. On a New 3DS, apps may
+ * also use core 2, so heavy threads can run alongside the main thread instead of taking turns.
+ * @return the thread, or nullptr if the core is not available (such as on an Old 3DS).
+ */
+void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core);
+void Join3dsThread(void* thread);
+
+/**
  * @brief Window backend for the Nintendo 3DS.
  *
  * The game draws to the 400x240 top screen; the bottom screen is a text console that shows

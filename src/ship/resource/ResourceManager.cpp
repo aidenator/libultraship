@@ -4,6 +4,7 @@
 #include "ship/resource/archive/Archive.h"
 #include <algorithm>
 #include <thread>
+#include <chrono>
 #include "ship/utils/StringHelper.h"
 #include "ship/utils/Utils.h"
 #include "ship/config/ConsoleVariable.h"
@@ -98,6 +99,9 @@ std::shared_ptr<File> ResourceManager::LoadFileProcess(const ResourceIdentifier&
     return file;
 }
 
+std::atomic<uint32_t> ResourceManager::sResourcesLoaded = 0;
+std::atomic<uint64_t> ResourceManager::sLoadMicroseconds = 0;
+
 std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceIdentifier& identifier, bool loadExact,
                                                                 std::shared_ptr<ResourceInitData> initData) {
     // Check for and remove the OTR signature
@@ -152,6 +156,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     // Get the file from the OTR. It may be null when the resource exists only as a `.meta`
     // alias (no real file at this path); fall through so the loader can resolve the alias,
     // but only when a `.meta` for this path actually exists.
+    const auto loadStart = std::chrono::steady_clock::now();
     auto file = LoadFileProcess(identifier.Path);
     if (file == nullptr && !mArchiveManager->HasFile(identifier.Path + ".meta")) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
@@ -161,6 +166,10 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
 
     // Transform the raw data into a resource
     auto resource = GetResourceLoader()->LoadResource(identifier.Path, file, initData);
+    sLoadMicroseconds += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - loadStart)
+                             .count();
+    sResourcesLoaded++;
 
     // Another thread could have loaded the resource while we were processing, so we want to check before setting to
     // the cache.
@@ -229,7 +238,19 @@ ResourceManager::LoadResourceAsync(const std::string& filePath, bool loadExact, 
 
 std::shared_ptr<IResource> ResourceManager::LoadResource(const ResourceIdentifier& identifier, bool loadExact,
                                                          std::shared_ptr<ResourceInitData> initData) {
+#ifdef __3DS__
+    // Load on the calling thread: the caller would only block until a pool thread, which runs
+    // at the lowest priority on the same core, got around to it
+    if (OtrSignatureCheck(identifier.Path.c_str())) {
+        return LoadResource({ identifier.Path.substr(7), identifier.Owner, identifier.Parent }, loadExact, initData);
+    }
+    auto resource = GetCachedResource(identifier, loadExact);
+    if (resource == nullptr) {
+        resource = LoadResourceProcess(identifier, loadExact, initData);
+    }
+#else
     auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
+#endif
     if (resource == nullptr) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
     }

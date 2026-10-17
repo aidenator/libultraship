@@ -18,6 +18,7 @@
 #include "fast/lus_gbi.h"
 #include "fast3d_shbin.h"
 #include "ship/resource/archive/O2rArchive.h"
+#include "ship/resource/ResourceManager.h"
 
 // Render the RGBA8 target into the RGB8 screen framebuffer without scaling
 #define DISPLAY_TRANSFER_FLAGS                                                                                    \
@@ -28,6 +29,12 @@
 namespace Fast {
 
 using namespace Citro3D;
+
+// Texture decoding in the interpreter (interpreter.cpp), for the slow-frame report
+extern std::atomic<uint32_t> gTexturesImported;
+extern std::atomic<uint64_t> gTextureImportMicroseconds;
+extern std::atomic<uint64_t> gVertexMicroseconds;
+extern std::atomic<uint64_t> gBackendDrawMicroseconds;
 
 namespace {
 
@@ -1003,8 +1010,15 @@ void GfxRenderingAPICitro3D::OnResize() {
 }
 
 void GfxRenderingAPICitro3D::StartFrame() {
+    const uint64_t beginTick = svcGetSystemTick();
+    // Wait only for the last frame's GPU work (the vertex buffer is reused). Not SYNCDRAW: that
+    // also waits for the display's next vblank, which the game's own frame timer is not in step
+    // with, so each frame would lose up to 16.7 ms before drawing even starts. The screen still
+    // only flips during vblank.
+    C3D_FrameBegin(0);
+    // Drawing time starts after FrameBegin
     mFrameStartTick = svcGetSystemTick();
-    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    mWaitTicksTotal += mFrameStartTick - beginTick;
     C3D_FrameDrawOn(mTopTarget);
     mCurrentTarget = mTopTarget;
     mTargetWidth = kScreenWidth;
@@ -1024,25 +1038,54 @@ void GfxRenderingAPICitro3D::EndFrame() {
     // happened in between, on any thread
     const uint32_t filesRead = Ship::O2rArchive::sFilesRead.load();
     const uint64_t readMicros = Ship::O2rArchive::sReadMicroseconds.load();
+    const uint32_t loaded = Ship::ResourceManager::sResourcesLoaded.load();
+    const uint64_t loadMicros = Ship::ResourceManager::sLoadMicroseconds.load();
+    const uint32_t imported = gTexturesImported.load();
+    const uint64_t importMicros = gTextureImportMicroseconds.load();
     if (mLastFrameEndTick != 0) {
         const double toMs = 1000.0 / SYSCLOCK_ARM11;
         const double frameMs = (double)(now - mLastFrameEndTick) * toMs;
         if (frameMs > kSlowFrameMs) {
-            printf("slow frame: %.0f ms (draw %.0f, gpu %.1f), %lu files read in %.0f ms, %lu uploads in %.0f ms\n",
+            printf("slow frame: %.0f ms (draw %.0f, gpu %.1f, %lu draws, %lu tris)\n"
+                   "  loaded %lu resources in %.0f ms (reading %lu files: %.0f ms), "
+                   "decoded %lu textures in %.0f ms (uploading: %.0f ms)\n",
                    frameMs, (double)(now - mFrameStartTick) * toMs, C3D_GetDrawingTime(),
+                   (unsigned long)mFrameDraws, (unsigned long)mFrameTris,
+                   (unsigned long)(loaded - mLoadedAtFrameEnd), (loadMicros - mLoadMicrosAtFrameEnd) / 1000.0,
                    (unsigned long)(filesRead - mFilesReadAtFrameEnd), (readMicros - mReadMicrosAtFrameEnd) / 1000.0,
-                   (unsigned long)mFrameUploads, (double)mUploadTicks * toMs);
+                   (unsigned long)(imported - mImportedAtFrameEnd), (importMicros - mImportMicrosAtFrameEnd) / 1000.0,
+                   (double)mUploadTicks * toMs);
         }
     }
+    const uint64_t drawTicks = now - mFrameStartTick;
+    mDrawTicksTotal += drawTicks;
+    mDrawTicksMax = std::max(mDrawTicksMax, drawTicks);
     mLastFrameEndTick = now;
     mFilesReadAtFrameEnd = filesRead;
     mReadMicrosAtFrameEnd = readMicros;
+    mLoadedAtFrameEnd = loaded;
+    mLoadMicrosAtFrameEnd = loadMicros;
+    mImportedAtFrameEnd = imported;
+    mImportMicrosAtFrameEnd = importMicros;
     mUploadTicks = 0;
     const double elapsed = (double)(now - mStatsTick) / SYSCLOCK_ARM11;
     if (elapsed >= kStatsIntervalSeconds) {
-        printf("frame %lu: %.1f fps, %lu draws, %lu tris, %lu uploads/frame, gpu %.1f ms\n",
+        const double toMs = 1000.0 / SYSCLOCK_ARM11;
+        const uint64_t vertexMicros = gVertexMicroseconds.load();
+        const uint64_t backendMicros = gBackendDrawMicroseconds.load();
+        printf("frame %lu: %.1f fps, %lu draws, %lu tris, %lu uploads/frame, gpu %.1f ms, "
+               "draw %.1f ms (worst %.0f: vertices %.1f, backend %.1f), waiting for the GPU %.1f ms\n",
                (unsigned long)mFrameCount, mFrameCount / elapsed, (unsigned long)mFrameDraws,
-               (unsigned long)mFrameTris, (unsigned long)mFrameUploads, C3D_GetDrawingTime());
+               (unsigned long)mFrameTris, (unsigned long)mFrameUploads, C3D_GetDrawingTime(),
+               (double)mDrawTicksTotal * toMs / mFrameCount, (double)mDrawTicksMax * toMs,
+               (vertexMicros - mVertexMicrosAtSummary) / 1000.0 / mFrameCount,
+               (backendMicros - mBackendMicrosAtSummary) / 1000.0 / mFrameCount,
+               (double)mWaitTicksTotal * toMs / mFrameCount);
+        mWaitTicksTotal = 0;
+        mVertexMicrosAtSummary = vertexMicros;
+        mBackendMicrosAtSummary = backendMicros;
+        mDrawTicksTotal = 0;
+        mDrawTicksMax = 0;
         mFrameCount = 0;
         mStatsTick = now;
     }

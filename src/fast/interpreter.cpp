@@ -1,5 +1,7 @@
 #define NOMINMAX
 
+#include <atomic>
+#include <chrono>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -139,9 +141,26 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
+// Time spent transforming vertices and in the backend's draw calls, for the renderer's log
+std::atomic<uint64_t> gVertexMicroseconds = 0;
+std::atomic<uint64_t> gBackendDrawMicroseconds = 0;
+
+namespace {
+struct MicrosecondTimer {
+    std::atomic<uint64_t>& total;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~MicrosecondTimer() {
+        total += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                                start)
+                     .count();
+    }
+};
+} // namespace
+
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+        MicrosecondTimer backendTimer{ gBackendDrawMicroseconds };
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
@@ -1252,7 +1271,19 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
 }
 
+std::atomic<uint32_t> gTexturesImported = 0;
+std::atomic<uint64_t> gTextureImportMicroseconds = 0;
+
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
+    struct ImportTimer {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~ImportTimer() {
+            gTextureImportMicroseconds += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                              std::chrono::steady_clock::now() - start)
+                                              .count();
+            gTexturesImported++;
+        }
+    } importTimer;
     uint8_t fmt = mRdp->texture_tile[tile].fmt;
     uint8_t siz = mRdp->texture_tile[tile].siz;
     uint32_t texFlags = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags;
@@ -1583,6 +1614,7 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    MicrosecondTimer vertexTimer{ gVertexMicroseconds };
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;

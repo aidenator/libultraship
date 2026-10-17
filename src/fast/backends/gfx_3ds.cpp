@@ -46,6 +46,22 @@ extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* at
 
 namespace Fast {
 
+void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core) {
+    bool isNew3ds = false;
+    APT_CheckNew3DS(&isNew3ds);
+    if (core == 2 && !isNew3ds) {
+        return nullptr;
+    }
+    s32 priority = 0x30;
+    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+    return threadCreate(entry, arg, kMinThreadStackSize, priority, core, false);
+}
+
+void Join3dsThread(void* thread) {
+    threadJoin((Thread)thread, U64_MAX);
+    threadFree((Thread)thread);
+}
+
 // Bring up the screens and the bottom-screen console before main(), so output from startup
 // (spdlog's default logger writes to stdout until the game configures logging) is visible.
 static struct EarlyConsole {
@@ -185,7 +201,7 @@ bool GfxWindowBackend3DS::IsFrameReady() {
 }
 
 void GfxWindowBackend3DS::SwapBuffersBegin() {
-    // The citro3d frame (C3D_FrameBegin with SYNCDRAW) already waits for vblank
+    // The game paces itself; citro3d flips the screen during vblank (see GfxRenderingAPICitro3D::StartFrame)
 }
 
 void GfxWindowBackend3DS::SwapBuffersEnd() {
