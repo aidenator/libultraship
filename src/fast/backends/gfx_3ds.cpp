@@ -14,6 +14,7 @@
 
 #include "fast/Fast3dGui.h"
 #include "ship/Context.h"
+#include "ship/controller/controldeck/ControlDeck.h"
 
 #include <pthread.h>
 
@@ -160,6 +161,18 @@ void GfxWindowBackend3DS::HandleEvents() {
     // SDL's joystick driver then reads the result in SDL_PumpEvents.
     hidScanInput();
     SDL_PumpEvents();
+    // The SDL backend drains the queue each frame, and the headless GUI never runs the element
+    // that connects gamepads, so do both here: connect the 3DS's own buttons, drop the rest.
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        auto devices = Ship::Context::GetRawInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager();
+        if (event.type == SDL_CONTROLLERDEVICEADDED) {
+            devices->HandlePhysicalDeviceConnect(event.cdevice.which);
+            printf("Controller connected: %s\n", SDL_GameControllerNameForIndex(event.cdevice.which));
+        } else if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
+            devices->HandlePhysicalDeviceDisconnect(event.cdevice.which);
+        }
+    }
     // START + SELECT quits, so a .3dsx returns to the Homebrew Launcher. SELECT has no N64 button.
     if (mIsRunning && (hidKeysHeld() & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT)) {
         printf("START + SELECT: exiting\n");
