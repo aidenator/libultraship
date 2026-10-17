@@ -3,6 +3,7 @@
 #include "fast/backends/gfx_3ds.h"
 
 #include <cstdio>
+#include <malloc.h>
 
 // The build renames libultra's osGetTime; lift that while libctru declares its own
 #pragma push_macro("osGetTime")
@@ -52,6 +53,18 @@ static struct EarlyConsole {
         osSetSpeedupEnable(true);
         gfxInitDefault();
         consoleInit(GFX_BOTTOM, nullptr);
+
+        // Started with `3dslink -s`: send stdout and stderr to the host's terminal instead
+        if (__3dslink_host.s_addr != 0) {
+            static constexpr u32 kSocBufferSize = 0x40000;
+            void* socBuffer = memalign(0x1000, kSocBufferSize);
+            if (socBuffer != nullptr && R_SUCCEEDED(socInit((u32*)socBuffer, kSocBufferSize))) {
+                printf("Logging to 3dslink host\n");
+                if (link3dsStdio() >= 0) {
+                    setvbuf(stdout, nullptr, _IOLBF, 0);
+                }
+            }
+        }
     }
 } sEarlyConsole;
 
@@ -143,8 +156,15 @@ void GfxWindowBackend3DS::HandleEvents() {
         printf("System requested exit\n");
         mIsRunning = false;
     }
-    // SDL's 3DS joystick driver reads the buttons here
+    // SDL scans the buttons in its 3DS video driver, which this backend does not use, so scan here.
+    // SDL's joystick driver then reads the result in SDL_PumpEvents.
+    hidScanInput();
     SDL_PumpEvents();
+    // START + SELECT quits, so a .3dsx returns to the Homebrew Launcher. SELECT has no N64 button.
+    if (mIsRunning && (hidKeysHeld() & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT)) {
+        printf("START + SELECT: exiting\n");
+        mIsRunning = false;
+    }
 }
 
 bool GfxWindowBackend3DS::IsFrameReady() {
