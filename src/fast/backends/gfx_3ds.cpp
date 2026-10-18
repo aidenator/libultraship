@@ -2,8 +2,11 @@
 
 #include "fast/backends/gfx_3ds.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <malloc.h>
+#include <sys/iosupport.h>
 
 // The build renames libultra's osGetTime; lift that while libctru declares its own
 #pragma push_macro("osGetTime")
@@ -62,6 +65,12 @@ void Join3dsThread(void* thread) {
     threadFree((Thread)thread);
 }
 
+// The console's own output device, kept so the status screen can draw after stdout moves away
+static const devoptab_t* sConsoleDevice = nullptr;
+static bool sStdoutToHost = false;
+static bool sStatusScreenUp = false;
+static int sShownFps = -1;
+
 // Bring up the screens and the bottom-screen console before main(), so output from startup
 // (spdlog's default logger writes to stdout until the game configures logging) is visible.
 static struct EarlyConsole {
@@ -70,6 +79,7 @@ static struct EarlyConsole {
         osSetSpeedupEnable(true);
         gfxInitDefault();
         consoleInit(GFX_BOTTOM, nullptr);
+        sConsoleDevice = devoptab_list[STD_OUT];
 
         // Started with `3dslink -s`: send stdout and stderr to the host's terminal instead
         if (__3dslink_host.s_addr != 0) {
@@ -79,11 +89,61 @@ static struct EarlyConsole {
                 printf("Logging to 3dslink host\n");
                 if (link3dsStdio() >= 0) {
                     setvbuf(stdout, nullptr, _IOLBF, 0);
+                    sStdoutToHost = true;
                 }
             }
         }
     }
 } sEarlyConsole;
+
+static ssize_t DiscardWrite(struct _reent* r, void* fd, const char* ptr, size_t len) {
+    return len;
+}
+
+static void ConsoleWrite(const char* text) {
+    sConsoleDevice->write_r(_REENT, nullptr, text, strlen(text));
+}
+
+// Text centred on a row of the 40x30 console, replacing whatever the row held
+static void ConsoleRow(int row, const char* color, const char* text) {
+    char line[96];
+    const int column = std::max(0, (40 - (int)strlen(text)) / 2);
+    snprintf(line, sizeof(line), "\x1b[%d;1H\x1b[2K\x1b[%d;%dH%s%s\x1b[0m", row + 1, row + 1, column + 1, color,
+             text);
+    ConsoleWrite(line);
+}
+
+void Show3dsStatusScreen(const char* title, const char* version) {
+    if (sConsoleDevice == nullptr || sStatusScreenUp) {
+        return;
+    }
+    if (!sStdoutToHost) {
+        // Nothing else may write to the console now; the log file still gets everything
+        static devoptab_t discard = {};
+        discard.name = "discard";
+        discard.write_r = DiscardWrite;
+        fflush(stdout);
+        fflush(stderr);
+        devoptab_list[STD_OUT] = &discard;
+        devoptab_list[STD_ERR] = &discard;
+    }
+    sStatusScreenUp = true;
+    ConsoleWrite("\x1b[2J");
+    ConsoleRow(10, "\x1b[33;1m", title);
+    ConsoleRow(12, "", version);
+    ConsoleRow(27, "\x1b[2m", "START + SELECT to quit");
+}
+
+void Update3dsStatusFps(float fps) {
+    const int rounded = (int)(fps + 0.5f);
+    if (!sStatusScreenUp || rounded == sShownFps) {
+        return;
+    }
+    sShownFps = rounded;
+    char text[16];
+    snprintf(text, sizeof(text), "%d fps", rounded);
+    ConsoleRow(16, "\x1b[32m", text);
+}
 
 void GfxWindowBackend3DS::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
                                uint32_t height, int32_t posX, int32_t posY) {

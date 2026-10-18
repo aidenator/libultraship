@@ -1,6 +1,7 @@
 #ifdef __3DS__
 
 #include "fast/backends/gfx_citro3d.h"
+#include "fast/backends/gfx_3ds.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1056,6 +1057,15 @@ void GfxRenderingAPICitro3D::EndFrame() {
                    (unsigned long)(imported - mImportedAtFrameEnd), (importMicros - mImportMicrosAtFrameEnd) / 1000.0,
                    (double)mUploadTicks * toMs);
         }
+    }
+    mFpsFrames++;
+    if (mFpsTick == 0) {
+        mFpsTick = now;
+        mFpsFrames = 0;
+    } else if (now - mFpsTick >= SYSCLOCK_ARM11) {
+        Update3dsStatusFps(mFpsFrames * (float)SYSCLOCK_ARM11 / (now - mFpsTick));
+        mFpsFrames = 0;
+        mFpsTick = now;
     }
     const uint64_t drawTicks = now - mFrameStartTick;
     mDrawTicksTotal += drawTicks;

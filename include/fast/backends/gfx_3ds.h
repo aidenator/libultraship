@@ -16,10 +16,22 @@ void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core);
 void Join3dsThread(void* thread);
 
 /**
+ * @brief Turns the bottom screen from the startup log into a status screen.
+ *
+ * Until this is called, the bottom screen shows stdout, so startup problems are readable on the
+ * device. Afterwards it shows the title, version and frame rate, and stdout goes only to a
+ * 3dslink host (if one is connected) and the log file.
+ */
+void Show3dsStatusScreen(const char* title, const char* version);
+
+/// Shows a new frame rate on the status screen (if it is up). Call from the render thread.
+void Update3dsStatusFps(float fps);
+
+/**
  * @brief Window backend for the Nintendo 3DS.
  *
  * The game draws to the 400x240 top screen; the bottom screen is a text console that shows
- * stdout, so log output is readable on the device. Input and audio stay with SDL2, which this
+ * stdout during startup, then a status screen (see Show3dsStatusScreen). Input and audio stay with SDL2, which this
  * backend pumps each frame. There is no keyboard, mouse or windowing, so those calls do nothing.
  */
 class GfxWindowBackend3DS final : public GfxWindowBackend {

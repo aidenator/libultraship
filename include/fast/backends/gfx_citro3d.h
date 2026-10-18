@@ -175,6 +175,8 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     uint32_t mFrameDraws = 0;
     uint32_t mFrameUploads = 0;
     uint64_t mStatsTick = 0;
+    uint32_t mFpsFrames = 0; // for the bottom screen, once a second
+    uint64_t mFpsTick = 0;
 
     // Slow-frame report: one line for any frame that takes much longer than the game's rate
     uint64_t mFrameStartTick = 0;
