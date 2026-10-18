@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
 
 // The build renames libultra's osGetTime; lift that while libctru declares its own
 #pragma push_macro("osGetTime")
@@ -1083,14 +1084,17 @@ void GfxRenderingAPICitro3D::EndFrame() {
         const double toMs = 1000.0 / SYSCLOCK_ARM11;
         const uint64_t vertexMicros = gVertexMicroseconds.load();
         const uint64_t backendMicros = gBackendDrawMicroseconds.load();
+        const struct mallinfo heap = mallinfo();
         printf("frame %lu: %.1f fps, %lu draws, %lu tris, %lu uploads/frame, gpu %.1f ms, "
-               "draw %.1f ms (worst %.0f: vertices %.1f, backend %.1f), waiting for the GPU %.1f ms\n",
+               "draw %.1f ms (worst %.0f: vertices %.1f, backend %.1f), waiting for the GPU %.1f ms, "
+               "heap %lu/%lu KB in use, linear %lu KB free\n",
                (unsigned long)mFrameCount, mFrameCount / elapsed, (unsigned long)mFrameDraws,
                (unsigned long)mFrameTris, (unsigned long)mFrameUploads, C3D_GetDrawingTime(),
                (double)mDrawTicksTotal * toMs / mFrameCount, (double)mDrawTicksMax * toMs,
                (vertexMicros - mVertexMicrosAtSummary) / 1000.0 / mFrameCount,
                (backendMicros - mBackendMicrosAtSummary) / 1000.0 / mFrameCount,
-               (double)mWaitTicksTotal * toMs / mFrameCount);
+               (double)mWaitTicksTotal * toMs / mFrameCount, (unsigned long)(heap.uordblks / 1024),
+               (unsigned long)(envGetHeapSize() / 1024), (unsigned long)(linearSpaceFree() / 1024));
         mWaitTicksTotal = 0;
         mVertexMicrosAtSummary = vertexMicros;
         mBackendMicrosAtSummary = backendMicros;
