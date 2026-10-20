@@ -13,6 +13,7 @@
 #undef osGetTime
 #include <3ds.h>
 #pragma pop_macro("osGetTime")
+#include <citro3d.h>
 #include <SDL2/SDL.h>
 
 #include "fast/Fast3dGui.h"
@@ -52,12 +53,29 @@ namespace Fast {
 void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core) {
     bool isNew3ds = false;
     APT_CheckNew3DS(&isNew3ds);
-    if (core == 2 && !isNew3ds) {
+    if (core >= 2 && !isNew3ds) {
         return nullptr;
+    }
+    // Core 1 is the system's, and an app may only use the share of it the system grants. 80% is
+    // the most the system accepts.
+    static bool sCore1Granted = false;
+    if (core == 1 && !sCore1Granted) {
+        const Result res = APT_SetAppCpuTimeLimit(80);
+        if (R_FAILED(res)) {
+            printf("No time on core 1 (0x%08lx)\n", (unsigned long)res);
+            return nullptr;
+        }
+        sCore1Granted = true;
     }
     s32 priority = 0x30;
     svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
     return threadCreate(entry, arg, kMinThreadStackSize, priority, core, false);
+}
+
+bool Is3dsNew() {
+    bool isNew3ds = false;
+    APT_CheckNew3DS(&isNew3ds);
+    return isNew3ds;
 }
 
 void Join3dsThread(void* thread) {
@@ -143,6 +161,12 @@ void Update3dsStatusFps(float fps) {
     char text[16];
     snprintf(text, sizeof(text), "%d fps", rounded);
     ConsoleRow(16, "\x1b[32m", text);
+}
+
+void Update3dsStatusNote(const char* text) {
+    if (sStatusScreenUp) {
+        ConsoleRow(18, "\x1b[33m", text);
+    }
 }
 
 void GfxWindowBackend3DS::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
@@ -261,7 +285,18 @@ bool GfxWindowBackend3DS::IsFrameReady() {
 }
 
 void GfxWindowBackend3DS::SwapBuffersBegin() {
-    // The game paces itself; citro3d flips the screen during vblank (see GfxRenderingAPICitro3D::StartFrame)
+    // At the game's own rate (20 or 30 fps) the game paces itself; citro3d flips the screen during
+    // vblank (see GfxRenderingAPICitro3D::StartFrame). Drawing in-between frames, the frame pacer
+    // presents as fast as it can draw and counts on the swap waiting for the screen, as vsync does
+    // on PC: without that it draws frames the screen never shows. One frame per refresh is enough;
+    // when a refresh has already passed since the last present, drawing the next frame while the
+    // GPU finishes this one beats waiting for another.
+    if (mTargetFps >= 60) {
+        if (C3D_FrameCounter(0) == mLastPresentVBlank) {
+            gspWaitForVBlank();
+        }
+        mLastPresentVBlank = C3D_FrameCounter(0);
+    }
 }
 
 void GfxWindowBackend3DS::SwapBuffersEnd() {

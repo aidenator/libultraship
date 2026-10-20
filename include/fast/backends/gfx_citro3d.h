@@ -142,6 +142,39 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void ApplyDepth();
     void ApplyBlendAndAlphaTest();
     void DrawRun(const float* buf, size_t firstTri, size_t numTris, int primaryRgb, int primaryAlpha);
+    void SubmitDraws();
+
+    // Deferred drawing. During a frame the interpreter's calls are only recorded, while the GPU
+    // is still drawing the previous frame; EndFrame waits for the GPU and replays them, running the
+    // same methods for real. Texture uploads happen at once (waiting for the GPU first).
+    enum class OpType : uint8_t {
+        LoadShader,
+        SelectTexture,
+        SelectTextureFb,
+        SetSampler,
+        DepthTestAndMask,
+        ZmodeDecal,
+        Viewport,
+        Scissor,
+        UseAlpha,
+        PrimDepth,
+        Draw,
+        DrawToFramebuffer,
+        CopyFramebuffer,
+        Clear,
+    };
+    struct Op {
+        OpType type;
+        int args[10];
+        float value;
+        ShaderProgram* shader;
+    };
+    Op& Record(OpType type);
+    void BeginGpuFrame();
+    void Replay();
+    void UpdateGpuTest();
+    void BindUnit(int unit, void* tex);
+    void ApplyTextureUnits(const Citro3D::TevProgram& program);
 
     C3D_RenderTarget_tag* mTopTarget = nullptr;
     C3D_RenderTarget_tag* mCurrentTarget = nullptr;
@@ -156,24 +189,52 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     uint32_t mBoundTexture[2] = { 0, 0 };
     int mLastSelectedUnit = 0;
     void* mFogRamp = nullptr; // C3D_Tex
+    // What each texture unit should hold (C3D_Tex) and what the GPU has. A unit is only switched
+    // on for draws whose combiner reads it: the GPU fetches from every enabled unit for each pixel.
+    void* mUnitTex[3] = {};
+    void* mDummyTex = nullptr; // C3D_Tex: 8x8, for units 1 and 2, which citro3d cannot leave empty
+    void* mUnitApplied[3] = {};
+    bool mUnitStale[3] = {};
 
     float* mVbo = nullptr; // linear memory, refilled every frame
     size_t mVboUsed = 0;   // vertices
     uint32_t mDrawsSinceSubmit = 0; // draws still in the command list, not yet sent to the GPU
+    std::vector<Op> mOps;           // this frame's recorded calls
+    std::vector<float> mOpFloats;   // the vertices of the recorded draws
+    bool mReplaying = false;
+    bool mGpuFrameBegun = false;    // waited for the GPU this frame
+    int mRecSelectedUnit = 0;       // the texture the game last selected, as it records
+    uint32_t mRecBoundTexture[2] = { 0, 0 };
+    std::vector<uint32_t> mTexturesToFree;  // deleted this frame
+    std::vector<uint32_t> mTexturesFreeable; // deleted before the frame the GPU is drawing
+    size_t mVboSubmitted = 0;       // vertices already flushed from the CPU cache for the GPU
     bool mVboFullReported = false;
 
     bool mDepthTest = false;
     bool mDepthMask = true;
     bool mDecal = false;
     bool mUseAlpha = false;
+    // The GPU state set by the last draw, so a draw that repeats it sends nothing
+    const Citro3D::TevProgram* mLastTevProgram = nullptr;
+    uint32_t mLastTevColors[6] = {};
+    int mLastDepthKey = -1;
+    int mLastBlendKey = -1;
     float mPrimDepth = 0.0f;
     FilteringMode mFilterMode = FILTER_LINEAR;
+
+    // A test that turns one GPU cost off, to find what the GPU spends its time on: cycled with
+    // SELECT + R
+    enum class GpuTest { Off, TinyScissor, NoBlending, NoDraws, Count };
+    GpuTest mGpuTest = GpuTest::Off;
+    uint32_t mHeldKeys = 0;
+    int mScissor[4] = { 0, 0, 400, 240 }; // what the game asked for: x, y, width, height
 
     // Statistics, printed every few seconds
     uint32_t mFrameCount = 0;
     uint32_t mFrameTris = 0;
     uint32_t mFrameDraws = 0;
     uint32_t mFrameUploads = 0;
+    uint32_t mTexturesByBits[3] = {}; // textures uploaded as 8, 16 and 32 bits a pixel
     uint64_t mStatsTick = 0;
     uint32_t mFpsFrames = 0; // for the bottom screen, once a second
     uint64_t mFpsTick = 0;
@@ -183,8 +244,6 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     uint64_t mDrawTicksTotal = 0; // since the last summary
     uint64_t mDrawTicksMax = 0;
     uint64_t mWaitTicksTotal = 0;
-    uint64_t mVertexMicrosAtSummary = 0;
-    uint64_t mBackendMicrosAtSummary = 0;
     uint64_t mLastFrameEndTick = 0;
     uint64_t mUploadTicks = 0;
     uint32_t mFilesReadAtFrameEnd = 0;

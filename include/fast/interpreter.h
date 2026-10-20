@@ -506,6 +506,34 @@ class Interpreter {
     RDP* mRdp;
     RenderingState mRenderingState{};
 
+    // The part of GfxSpTri1 that depends only on render state, not on the triangle's vertices.
+    // Worked out once and reused until a command that can change that state runs.
+    struct TriTexCoords {
+        float scaleU, scaleV; // from the vertex's S and T to texture coordinates
+        float offU, offV;
+        float rectOffU, rectOffV; // for texture rectangles, which skip the linear-filter half texel
+        bool clampS, clampT;
+        float clampU, clampV;
+    };
+    enum TriInputSource : uint8_t { TRI_INPUT_CONST, TRI_INPUT_SHADE, TRI_INPUT_LOD_FRACTION };
+    struct TriInput {
+        TriInputSource rgbSource, alphaSource;
+        float rgb[3];
+        float alpha;
+    };
+    struct TriangleState {
+        bool zFrom0To1, invertY;
+        bool useAlpha, useFog, useFogFromShade, useGrayscale;
+        bool usedTextures[2];
+        TriTexCoords tex[2];
+        float fog[4];
+        float grayscale[4];
+        uint8_t numInputs;
+        TriInput inputs[7];
+    };
+    TriangleState mTriState{};
+    bool mTriStateDirty = true;
+
     GfxTextureCache mTextureCache{};
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
     bool mResolvedResourceCacheEnabled = false;
@@ -567,6 +595,33 @@ void gfx_push_current_dir(char* path);
 int32_t gfx_check_image_signature(const char* imgData);
 const char* gfx_get_shader(int16_t id);
 const char* GfxGetOpcodeName(int8_t opcode);
+
+// What the renderer is doing right now: the display list command being run (its opcode, 0-0xFF)
+// or one of these. Plain stores, cheap enough for every command, so a profiler on another core
+// can sample it (the 3DS backend does).
+enum RenderPhase : uint32_t {
+    RENDER_PHASE_OUTSIDE_LIST = 0x100, // the renderer thread's other work, or waiting
+    RENDER_PHASE_LIST_SETUP,           // a list's start and end, outside its commands
+    RENDER_PHASE_TEXTURES,             // finding or decoding a triangle's textures
+    RENDER_PHASE_BACKEND,              // the rendering API drawing a batch of triangles
+    RENDER_PHASE_BACKEND_SCAN,         // the backend: finding which inputs vary across a batch
+    RENDER_PHASE_BACKEND_STATE,        // the backend: combiner, depth, blend and texture state
+    RENDER_PHASE_BACKEND_VERTICES,     // the backend: converting vertices
+    RENDER_PHASE_BACKEND_DRAW,         // the backend: the draw call itself
+    RENDER_PHASE_BACKEND_SUBMIT,       // the backend: sending a batch to the GPU
+    RENDER_PHASE_COUNT
+};
+extern volatile uint32_t gRenderPhase;
+
+struct RenderPhaseScope {
+    uint32_t prev;
+    explicit RenderPhaseScope(uint32_t phase) : prev(gRenderPhase) {
+        gRenderPhase = phase;
+    }
+    ~RenderPhaseScope() {
+        gRenderPhase = prev;
+    }
+};
 
 } // namespace Fast
 

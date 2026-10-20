@@ -8,12 +8,17 @@ namespace Fast {
 /**
  * @brief Starts entry(arg) on another CPU core, at the calling thread's priority.
  *
- * Every pthread (and so every std::thread) runs on the app's main core. On a New 3DS, apps may
- * also use core 2, so heavy threads can run alongside the main thread instead of taking turns.
+ * Every pthread (and so every std::thread) runs on the app's main core. Apps may also use 80% of
+ * core 1 (asked for here on its first use) and, on a New 3DS, core 2 and (from the Homebrew
+ * Launcher) usually core 3, so heavy threads can run alongside the main thread instead of taking
+ * turns.
  * @return the thread, or nullptr if the core is not available (such as on an Old 3DS).
  */
 void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core);
 void Join3dsThread(void* thread);
+
+/** @brief Whether this is a New 3DS (faster CPU, more cores) rather than an Old 3DS. */
+bool Is3dsNew();
 
 /**
  * @brief Turns the bottom screen from the startup log into a status screen.
@@ -26,6 +31,9 @@ void Show3dsStatusScreen(const char* title, const char* version);
 
 /// Shows a new frame rate on the status screen (if it is up). Call from the render thread.
 void Update3dsStatusFps(float fps);
+
+/// Shows a line of text under the frame rate on the status screen (if it is up)
+void Update3dsStatusNote(const char* text);
 
 /**
  * @brief Window backend for the Nintendo 3DS.
@@ -79,6 +87,7 @@ class GfxWindowBackend3DS final : public GfxWindowBackend {
   private:
     bool mIsRunning = true;
     int mTargetFps = 60;
+    uint32_t mLastPresentVBlank = 0; // the top screen's refresh count at the last present
 };
 
 } // namespace Fast
