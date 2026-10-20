@@ -38,9 +38,16 @@ extern std::atomic<uint32_t> gTexturesImported;
 extern std::atomic<uint64_t> gTextureImportMicroseconds;
 
 namespace {
+// Set on the thread running a replay: the backend's methods then act instead of recording. Per
+// thread, as the interpreter records the next frame meanwhile.
+thread_local bool tReplaying = false;
+
 // A sampling profiler: a thread on another core reads gRenderPhase every 200 us and counts what
-// the renderer was doing. Reading it costs the renderer nothing, unlike timing each command.
+// the renderer was doing. Reading it costs the renderer nothing, unlike timing each command. The
+// replay thread, if there is one, reports in sReplayPhase.
 uint32_t sPhaseSamples[RENDER_PHASE_COUNT] = {};
+volatile uint32_t sReplayPhase = RENDER_PHASE_OUTSIDE_LIST;
+uint32_t sReplaySamples[RENDER_PHASE_COUNT] = {};
 
 void SamplePhases(void*) {
     for (;;) {
@@ -48,6 +55,10 @@ void SamplePhases(void*) {
         const uint32_t phase = gRenderPhase;
         if (phase < RENDER_PHASE_COUNT) {
             sPhaseSamples[phase]++;
+        }
+        const uint32_t replayPhase = sReplayPhase;
+        if (replayPhase < RENDER_PHASE_COUNT) {
+            sReplaySamples[replayPhase]++;
         }
     }
 }
@@ -72,6 +83,8 @@ const char* PhaseName(uint32_t phase) {
             return "backend draw call";
         case RENDER_PHASE_BACKEND_SUBMIT:
             return "backend submit";
+        case RENDER_PHASE_TRI_STATE:
+            return "triangle state";
         default: {
             const char* name = GfxGetOpcodeName((int8_t)phase);
             return name != nullptr ? name : "?";
@@ -80,21 +93,20 @@ const char* PhaseName(uint32_t phase) {
 }
 
 // The phases that took the most samples since the last call, as a share of all samples
-void PrintPhaseProfile() {
-    static uint32_t sAtLastPrint[RENDER_PHASE_COUNT] = {};
+void PrintPhaseProfile(const char* label, const uint32_t* samples, uint32_t* atLastPrint) {
     uint32_t counts[RENDER_PHASE_COUNT];
     uint32_t total = 0;
     for (uint32_t i = 0; i < RENDER_PHASE_COUNT; i++) {
-        const uint32_t now = sPhaseSamples[i];
-        counts[i] = now - sAtLastPrint[i];
-        sAtLastPrint[i] = now;
+        const uint32_t now = samples[i];
+        counts[i] = now - atLastPrint[i];
+        atLastPrint[i] = now;
         total += counts[i];
     }
     if (total == 0) {
         return;
     }
     char line[512];
-    int len = snprintf(line, sizeof(line), "  renderer, %lu samples:", (unsigned long)total);
+    int len = snprintf(line, sizeof(line), "  %s, %lu samples:", label, (unsigned long)total);
     for (int shown = 0; shown < 10; shown++) {
         uint32_t best = 0;
         for (uint32_t i = 1; i < RENDER_PHASE_COUNT; i++) {
@@ -508,6 +520,14 @@ uint32_t NextPow2(uint32_t v) {
 } // namespace
 
 GfxRenderingAPICitro3D::~GfxRenderingAPICitro3D() {
+    if (mReplayThread != nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(mReplayMutex);
+            mReplayQuit = true;
+        }
+        mReplayCv.notify_all();
+        Join3dsThread(mReplayThread);
+    }
     for (auto* prg : mShaders) {
         delete prg;
     }
@@ -536,7 +556,7 @@ void GfxRenderingAPICitro3D::UnloadShader(ShaderProgram* oldPrg) {
 }
 
 void GfxRenderingAPICitro3D::LoadShader(ShaderProgram* newPrg) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Record(OpType::LoadShader).shader = newPrg;
         return;
     }
@@ -818,12 +838,11 @@ void GfxRenderingAPICitro3D::ApplyTextureUnits(const TevProgram& program) {
 }
 
 uint32_t GfxRenderingAPICitro3D::NewTexture() {
-    mTextures.emplace_back();
-    return (uint32_t)(mTextures.size() - 1);
+    return mRecTextureCount++;
 }
 
 void GfxRenderingAPICitro3D::SelectTexture(int tile, uint32_t textureId) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         // Uploads go straight to the texture the game last selected
         mRecSelectedUnit = tile;
         if (tile <= 1) {
@@ -848,6 +867,20 @@ void GfxRenderingAPICitro3D::SelectTexture(int tile, uint32_t textureId) {
 }
 
 void GfxRenderingAPICitro3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
+    // To the texture the game last selected, in order with the draws
+    if (mRecSelectedUnit > 1 || width == 0 || height == 0) {
+        return;
+    }
+    Op& op = Record(OpType::Upload);
+    op.args[0] = (int)mRecBoundTexture[mRecSelectedUnit];
+    op.args[1] = (int)width;
+    op.args[2] = (int)height;
+    op.args[3] = (int)mRec->pixels.size();
+    mRec->pixels.insert(mRec->pixels.end(), rgba32Buf, rgba32Buf + width * height * 4);
+}
+
+void GfxRenderingAPICitro3D::UploadTextureNow(uint32_t texId, const uint8_t* rgba32Buf, uint32_t width,
+                                              uint32_t height) {
     mFrameUploads++;
     const uint64_t uploadStart = svcGetSystemTick();
     struct AddTicks {
@@ -857,12 +890,10 @@ void GfxRenderingAPICitro3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t wi
             total += svcGetSystemTick() - start;
         }
     } addTicks{ mUploadTicks, uploadStart };
-    if (mRecSelectedUnit > 1 || width == 0 || height == 0) {
+    if (texId >= mTextures.size()) {
         return;
     }
-    // The GPU may still be drawing the last frame with this texture
-    BeginGpuFrame();
-    Texture& t = mTextures[mRecBoundTexture[mRecSelectedUnit]];
+    Texture& t = mTextures[texId];
 
     // The PICA needs power-of-two sizes of at least 8; pad by repeating the edge pixels
     const uint32_t texWidth = NextPow2(width);
@@ -929,7 +960,7 @@ void GfxRenderingAPICitro3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t wi
 }
 
 void GfxRenderingAPICitro3D::SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Op& op = Record(OpType::SetSampler);
         op.args[0] = sampler;
         op.args[1] = linear_filter;
@@ -946,6 +977,9 @@ void GfxRenderingAPICitro3D::SetSamplerParameters(int sampler, bool linear_filte
         C3D_TexSetFilter(fbTex, linear ? GPU_LINEAR : GPU_NEAREST, linear ? GPU_LINEAR : GPU_NEAREST);
         C3D_TexSetWrap(fbTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
         BindUnit(0, fbTex);
+        return;
+    }
+    if (mBoundTexture[sampler] >= mTextures.size()) {
         return;
     }
     Texture& t = mTextures[mBoundTexture[sampler]];
@@ -965,7 +999,7 @@ void GfxRenderingAPICitro3D::SetSamplerParameters(int sampler, bool linear_filte
 }
 
 void GfxRenderingAPICitro3D::SetDepthTestAndMask(bool depth_test, bool z_upd) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Op& op = Record(OpType::DepthTestAndMask);
         op.args[0] = depth_test;
         op.args[1] = z_upd;
@@ -976,7 +1010,7 @@ void GfxRenderingAPICitro3D::SetDepthTestAndMask(bool depth_test, bool z_upd) {
 }
 
 void GfxRenderingAPICitro3D::SetZmodeDecal(bool decal) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Record(OpType::ZmodeDecal).args[0] = decal;
         return;
     }
@@ -984,7 +1018,7 @@ void GfxRenderingAPICitro3D::SetZmodeDecal(bool decal) {
 }
 
 void GfxRenderingAPICitro3D::SetViewport(int x, int y, int width, int height) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Op& op = Record(OpType::Viewport);
         op.args[0] = x;
         op.args[1] = y;
@@ -997,7 +1031,7 @@ void GfxRenderingAPICitro3D::SetViewport(int x, int y, int width, int height) {
 }
 
 void GfxRenderingAPICitro3D::SetScissor(int x, int y, int width, int height) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Op& op = Record(OpType::Scissor);
         op.args[0] = x;
         op.args[1] = y;
@@ -1023,7 +1057,7 @@ void GfxRenderingAPICitro3D::SetScissor(int x, int y, int width, int height) {
 }
 
 void GfxRenderingAPICitro3D::SetUseAlpha(bool useAlpha) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Record(OpType::UseAlpha).args[0] = useAlpha;
         return;
     }
@@ -1108,7 +1142,7 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
     }
     const float* fog = fogOff >= 0 ? first + fogOff : nullptr;
 
-    gRenderPhase = RENDER_PHASE_BACKEND_STATE;
+    *mPhase = RENDER_PHASE_BACKEND_STATE;
     const TevProgram& program = GetTevProgram(prg, primaryRgb, primaryAlpha);
     ApplyTevProgram(program, inputs, cc.opt_fog, fog);
     ApplyTextureUnits(program);
@@ -1124,7 +1158,7 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
     // A framebuffer bound as texture 0 is sampled in its own sideways layout
     const Framebuffer* fbTex = (texOff[0] >= 0 && mBoundFramebuffer >= 0) ? &mFramebuffers[mBoundFramebuffer] : nullptr;
 
-    gRenderPhase = RENDER_PHASE_BACKEND_VERTICES;
+    *mPhase = RENDER_PHASE_BACKEND_VERTICES;
     float* dst = mVbo + mVboUsed * kVertexFloats;
     for (size_t i = 0; i < numVerts; i++) {
         const float* v = first + i * stride;
@@ -1167,11 +1201,11 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
         dst += kVertexFloats;
     }
 
-    gRenderPhase = RENDER_PHASE_BACKEND_DRAW;
+    *mPhase = RENDER_PHASE_BACKEND_DRAW;
     if (mGpuTest != GpuTest::NoDraws) {
         C3D_DrawArrays(GPU_TRIANGLES, (int)mVboUsed, (int)numVerts);
     }
-    gRenderPhase = RENDER_PHASE_BACKEND;
+    *mPhase = RENDER_PHASE_BACKEND;
     mVboUsed += numVerts;
     mFrameDraws++;
     mDrawsSinceSubmit++;
@@ -1181,7 +1215,8 @@ void GfxRenderingAPICitro3D::SubmitDraws() {
     if (mDrawsSinceSubmit == 0) {
         return;
     }
-    RenderPhaseScope phase{ RENDER_PHASE_BACKEND_SUBMIT };
+    const uint32_t prevPhase = *mPhase;
+    *mPhase = RENDER_PHASE_BACKEND_SUBMIT;
     // The GPU reads the vertex buffer from memory, not the CPU's cache
     if (mVboUsed > mVboSubmitted) {
         svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)(mVbo + mVboSubmitted * kVertexFloats),
@@ -1190,16 +1225,17 @@ void GfxRenderingAPICitro3D::SubmitDraws() {
     }
     C3D_FrameSplit(0);
     mDrawsSinceSubmit = 0;
+    *mPhase = prevPhase;
 }
 
 void GfxRenderingAPICitro3D::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         // The interpreter reuses its buffer, so keep a copy for the replay
         Op& op = Record(OpType::Draw);
-        op.args[0] = (int)mOpFloats.size();
+        op.args[0] = (int)mRec->floats.size();
         op.args[1] = (int)buf_vbo_len;
         op.args[2] = (int)buf_vbo_num_tris;
-        mOpFloats.insert(mOpFloats.end(), buf_vbo, buf_vbo + buf_vbo_len);
+        mRec->floats.insert(mRec->floats.end(), buf_vbo, buf_vbo + buf_vbo_len);
         return;
     }
     ShaderProgram* prg = mCurrentShader;
@@ -1213,7 +1249,7 @@ void GfxRenderingAPICitro3D::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, 
     const int inputOff = stride - prg->numInputs * inputFloats;
     const size_t numVerts = buf_vbo_num_tris * 3;
 
-    gRenderPhase = RENDER_PHASE_BACKEND_SCAN;
+    *mPhase = RENDER_PHASE_BACKEND_SCAN;
     // Which inputs vary across the batch: one per channel can be the vertex colour
     bool varyRgb[7] = {}, varyAlpha[7] = {};
     for (int j = 0; j < prg->numInputs; j++) {
@@ -1228,7 +1264,7 @@ void GfxRenderingAPICitro3D::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, 
             }
         }
     }
-    gRenderPhase = RENDER_PHASE_BACKEND;
+    *mPhase = RENDER_PHASE_BACKEND;
     int primaryRgb = -1, primaryAlpha = -1;
     int extraVarying = 0;
     for (int j = 0; j < prg->numInputs; j++) {
@@ -1336,6 +1372,20 @@ void GfxRenderingAPICitro3D::Init() {
     if (Start3dsThreadOnCore(SamplePhases, nullptr, 1) == nullptr) {
         printf("No renderer profiler\n");
     }
+
+    // The replay gets core 2, beside the game logic, which leaves most of it idle at 30 fps
+    mPhase = &sReplayPhase;
+    mReplayThread = Start3dsThreadOnCore([](void* self) { ((GfxRenderingAPICitro3D*)self)->ReplayLoop(); }, this, 2);
+    if (mReplayThread == nullptr) {
+        mPhase = &gRenderPhase;
+    } else {
+        // Ahead of the game thread: threads of equal priority on a core do not preempt each other,
+        // and a long game update would hold up the frame being shown
+        s32 priority = 0x30;
+        svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+        svcSetThreadPriority(threadGetHandle((Thread)mReplayThread), priority - 1);
+    }
+    printf("Replay %s\n", mReplayThread != nullptr ? "on core 2" : "in the renderer thread");
 }
 
 void GfxRenderingAPICitro3D::OnResize() {
@@ -1344,16 +1394,15 @@ void GfxRenderingAPICitro3D::OnResize() {
 void GfxRenderingAPICitro3D::StartFrame() {
     // Record this frame's drawing while the GPU is still busy with the last one
     mFrameStartTick = svcGetSystemTick();
-    mOps.clear();
-    mOpFloats.clear();
-    mGpuFrameBegun = false;
+    if (mMainEndTick != 0) {
+        mRec->gapTicks = mFrameStartTick - mMainEndTick;
+        const uint64_t vblankWait = g3dsVBlankWaitTicks;
+        mRec->vblankWaitTicks = vblankWait - mVBlankWaitAtEnd;
+        mVBlankWaitAtEnd = vblankWait;
+    }
 }
 
 void GfxRenderingAPICitro3D::BeginGpuFrame() {
-    if (mGpuFrameBegun) {
-        return;
-    }
-    mGpuFrameBegun = true;
     const uint64_t beginTick = svcGetSystemTick();
     // Wait for the last frame's GPU work (the vertex buffer and command list are reused). Not
     // SYNCDRAW: that also waits for the display's next vblank, which the game's own frame timer is
@@ -1369,8 +1418,14 @@ void GfxRenderingAPICitro3D::BeginGpuFrame() {
     mTexturesFreeable.clear();
 }
 
-void GfxRenderingAPICitro3D::Replay() {
+void GfxRenderingAPICitro3D::Replay(FrameRecord& frame) {
     BeginGpuFrame();
+    if (mTextures.size() < frame.textureCount) {
+        mTextures.resize(frame.textureCount);
+    }
+    if ((int)mFramebuffers.size() < frame.framebufferCount) {
+        mFramebuffers.resize(frame.framebufferCount);
+    }
     C3D_FrameDrawOn(mTopTarget);
     mCurrentTarget = mTopTarget;
     mTargetWidth = kScreenWidth;
@@ -1382,8 +1437,8 @@ void GfxRenderingAPICitro3D::Replay() {
     mLastDepthKey = -1;
     mLastBlendKey = -1;
 
-    mReplaying = true;
-    for (const Op& op : mOps) {
+    tReplaying = true;
+    for (const Op& op : frame.ops) {
         const int* a = op.args;
         switch (op.type) {
             case OpType::LoadShader:
@@ -1417,7 +1472,7 @@ void GfxRenderingAPICitro3D::Replay() {
                 SetCurrentPrimDepth(op.value);
                 break;
             case OpType::Draw:
-                DrawTriangles(mOpFloats.data() + a[0], (size_t)a[1], (size_t)a[2]);
+                DrawTriangles(frame.floats.data() + a[0], (size_t)a[1], (size_t)a[2]);
                 break;
             case OpType::DrawToFramebuffer:
                 StartDrawToFramebuffer(a[0], 1.0f);
@@ -1428,16 +1483,43 @@ void GfxRenderingAPICitro3D::Replay() {
             case OpType::Clear:
                 ClearFramebuffer(a[0] != 0, a[1] != 0);
                 break;
+            case OpType::Upload:
+                UploadTextureNow((uint32_t)a[0], frame.pixels.data() + a[3], (uint32_t)a[1], (uint32_t)a[2]);
+                break;
+            case OpType::FramebufferSize:
+                SetFramebufferSize(a[0], (uint32_t)a[1], (uint32_t)a[2]);
+                break;
         }
     }
-    mReplaying = false;
+    tReplaying = false;
     // Textures deleted this frame are freed once the GPU has drawn it
-    mTexturesFreeable.insert(mTexturesFreeable.end(), mTexturesToFree.begin(), mTexturesToFree.end());
-    mTexturesToFree.clear();
+    mTexturesFreeable.insert(mTexturesFreeable.end(), frame.deleted.begin(), frame.deleted.end());
+}
+
+void GfxRenderingAPICitro3D::ReplayLoop() {
+    for (;;) {
+        FrameRecord* frame;
+        {
+            std::unique_lock<std::mutex> lock(mReplayMutex);
+            mReplayCv.wait(lock, [this] { return mReplayFrame != nullptr || mReplayQuit; });
+            if (mReplayFrame == nullptr) {
+                return;
+            }
+            frame = mReplayFrame;
+        }
+        *mPhase = RENDER_PHASE_LIST_SETUP;
+        FinishFrame(*frame);
+        *mPhase = RENDER_PHASE_OUTSIDE_LIST; // idle
+        {
+            std::lock_guard<std::mutex> lock(mReplayMutex);
+            mReplayFrame = nullptr;
+        }
+        mReplayCv.notify_all();
+    }
 }
 
 GfxRenderingAPICitro3D::Op& GfxRenderingAPICitro3D::Record(OpType type) {
-    Op& op = mOps.emplace_back();
+    Op& op = mRec->ops.emplace_back();
     op.type = type;
     return op;
 }
@@ -1460,12 +1542,47 @@ void GfxRenderingAPICitro3D::UpdateGpuTest() {
     mStatsTick = svcGetSystemTick();
     mFrameCount = 0;
     mWaitTicksTotal = 0;
+    mReplayTicksTotal = 0;
+    mHandoffTicksTotal = 0;
+    mGapTicksTotal = 0;
+    mVBlankTicksTotal = 0;
     mDrawTicksTotal = 0;
     mDrawTicksMax = 0;
 }
 
 void GfxRenderingAPICitro3D::EndFrame() {
-    Replay();
+    FrameRecord& rec = *mRec;
+    rec.recordTicks = svcGetSystemTick() - mFrameStartTick;
+    rec.textureCount = mRecTextureCount;
+    rec.framebufferCount = mRecFramebufferCount;
+    if (mReplayThread == nullptr) {
+        FinishFrame(rec);
+    } else {
+        // Hand the frame over once the replay thread is done with the last one, and record the
+        // next one into that
+        const uint64_t waitStart = svcGetSystemTick();
+        {
+            std::unique_lock<std::mutex> lock(mReplayMutex);
+            mReplayCv.wait(lock, [this] { return mReplayFrame == nullptr; });
+            rec.handoffWaitTicks = svcGetSystemTick() - waitStart;
+            mReplayFrame = &rec;
+            mRec = &rec == &mFrames[0] ? &mFrames[1] : &mFrames[0];
+        }
+        mReplayCv.notify_all();
+    }
+    mRec->ops.clear();
+    mRec->floats.clear();
+    mRec->pixels.clear();
+    mRec->deleted.clear();
+    mRec->handoffWaitTicks = 0;
+    mRec->gapTicks = 0;
+    mRec->vblankWaitTicks = 0;
+    mMainEndTick = svcGetSystemTick();
+}
+
+void GfxRenderingAPICitro3D::FinishFrame(FrameRecord& frame) {
+    const uint64_t replayStart = svcGetSystemTick();
+    Replay(frame);
     SubmitDraws();
     C3D_FrameEnd(0);
     UpdateGpuTest();
@@ -1489,7 +1606,7 @@ void GfxRenderingAPICitro3D::EndFrame() {
             printf("slow frame: %.0f ms (draw %.0f, gpu %.1f, %lu draws, %lu tris)\n"
                    "  loaded %lu resources in %.0f ms (reading %lu files: %.0f ms), "
                    "decoded %lu textures in %.0f ms (uploading: %.0f ms)\n",
-                   frameMs, (double)(now - mFrameStartTick) * toMs, C3D_GetDrawingTime(),
+                   frameMs, (double)frame.recordTicks * toMs, C3D_GetDrawingTime(),
                    (unsigned long)mFrameDraws, (unsigned long)mFrameTris,
                    (unsigned long)(loaded - mLoadedAtFrameEnd), (loadMicros - mLoadMicrosAtFrameEnd) / 1000.0,
                    (unsigned long)(filesRead - mFilesReadAtFrameEnd), (readMicros - mReadMicrosAtFrameEnd) / 1000.0,
@@ -1506,8 +1623,12 @@ void GfxRenderingAPICitro3D::EndFrame() {
         mFpsFrames = 0;
         mFpsTick = now;
     }
-    const uint64_t drawTicks = now - mFrameStartTick;
+    const uint64_t drawTicks = frame.recordTicks;
     mDrawTicksTotal += drawTicks;
+    mReplayTicksTotal += now - replayStart;
+    mHandoffTicksTotal += frame.handoffWaitTicks;
+    mGapTicksTotal += frame.gapTicks;
+    mVBlankTicksTotal += frame.vblankWaitTicks;
     mDrawTicksMax = std::max(mDrawTicksMax, drawTicks);
     mLastFrameEndTick = now;
     mFilesReadAtFrameEnd = filesRead;
@@ -1522,18 +1643,30 @@ void GfxRenderingAPICitro3D::EndFrame() {
         const double toMs = 1000.0 / SYSCLOCK_ARM11;
         const struct mallinfo heap = mallinfo();
         printf("%sframe %lu: %.1f fps, %lu draws, %lu tris, %lu uploads/frame, gpu %.1f ms, "
-               "draw %.1f ms (worst %.0f), waiting for the GPU %.1f ms, "
+               "draw %.1f ms (worst %.0f), replay %.1f ms, waiting for the GPU %.1f ms, for the replay %.1f ms, "
+               "between frames %.1f ms (vblank %.1f), "
                "heap %lu/%lu KB in use, linear %lu KB free\n",
                mGpuTest == GpuTest::Off ? "" : "[test] ", (unsigned long)mFrameCount, mFrameCount / elapsed,
                (unsigned long)mFrameDraws,
                (unsigned long)mFrameTris, (unsigned long)mFrameUploads, C3D_GetDrawingTime(),
                (double)mDrawTicksTotal * toMs / mFrameCount, (double)mDrawTicksMax * toMs,
-               (double)mWaitTicksTotal * toMs / mFrameCount, (unsigned long)(heap.uordblks / 1024),
+               (double)mReplayTicksTotal * toMs / mFrameCount, (double)mWaitTicksTotal * toMs / mFrameCount,
+               (double)mHandoffTicksTotal * toMs / mFrameCount, (double)mGapTicksTotal * toMs / mFrameCount,
+               (double)mVBlankTicksTotal * toMs / mFrameCount, (unsigned long)(heap.uordblks / 1024),
                (unsigned long)(envGetHeapSize() / 1024), (unsigned long)(linearSpaceFree() / 1024));
-        PrintPhaseProfile();
+        static uint32_t sRendererAtLastPrint[RENDER_PHASE_COUNT] = {};
+        static uint32_t sReplayAtLastPrint[RENDER_PHASE_COUNT] = {};
+        PrintPhaseProfile("renderer", sPhaseSamples, sRendererAtLastPrint);
+        if (mReplayThread != nullptr) {
+            PrintPhaseProfile("replay", sReplaySamples, sReplayAtLastPrint);
+        }
         printf("  textures so far: %lu 8-bit, %lu 16-bit, %lu 32-bit\n", (unsigned long)mTexturesByBits[0],
                (unsigned long)mTexturesByBits[1], (unsigned long)mTexturesByBits[2]);
         mWaitTicksTotal = 0;
+        mReplayTicksTotal = 0;
+        mHandoffTicksTotal = 0;
+        mGapTicksTotal = 0;
+        mVBlankTicksTotal = 0;
         mDrawTicksTotal = 0;
         mDrawTicksMax = 0;
         mFrameCount = 0;
@@ -1548,13 +1681,19 @@ void GfxRenderingAPICitro3D::FinishRender() {
 }
 
 int GfxRenderingAPICitro3D::CreateFramebuffer() {
-    mFramebuffers.emplace_back();
-    return (int)mFramebuffers.size() - 1;
+    return mRecFramebufferCount++;
 }
 
 void GfxRenderingAPICitro3D::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height,
                                                          uint32_t msaa_level, bool opengl_invertY, bool render_target,
                                                          bool has_depth_buffer, bool can_extract_depth) {
+    Op& op = Record(OpType::FramebufferSize);
+    op.args[0] = fb_id;
+    op.args[1] = (int)width;
+    op.args[2] = (int)height;
+}
+
+void GfxRenderingAPICitro3D::SetFramebufferSize(int fb_id, uint32_t width, uint32_t height) {
     if (fb_id <= 0 || fb_id >= (int)mFramebuffers.size()) {
         return; // the screen keeps its size
     }
@@ -1577,7 +1716,7 @@ void GfxRenderingAPICitro3D::UpdateFramebufferParameters(int fb_id, uint32_t wid
 }
 
 void GfxRenderingAPICitro3D::StartDrawToFramebuffer(int fbId, float noiseScale) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Record(OpType::DrawToFramebuffer).args[0] = fbId;
         return;
     }
@@ -1606,7 +1745,7 @@ void GfxRenderingAPICitro3D::StartDrawToFramebuffer(int fbId, float noiseScale) 
 
 void GfxRenderingAPICitro3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1,
                                              int dstX0, int dstY0, int dstX1, int dstY1) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Op& op = Record(OpType::CopyFramebuffer);
         const int args[10] = { fbDstId, fbSrcId, srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1 };
         memcpy(op.args, args, sizeof(args));
@@ -1634,7 +1773,7 @@ void GfxRenderingAPICitro3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0
 }
 
 void GfxRenderingAPICitro3D::ClearFramebuffer(bool color, bool depth) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Op& op = Record(OpType::Clear);
         op.args[0] = color;
         op.args[1] = depth;
@@ -1671,7 +1810,7 @@ void* GfxRenderingAPICitro3D::GetFramebufferTextureId(int fbId) {
 }
 
 void GfxRenderingAPICitro3D::SelectTextureFb(int fbId) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Record(OpType::SelectTextureFb).args[0] = fbId;
         return;
     }
@@ -1685,8 +1824,8 @@ void GfxRenderingAPICitro3D::SelectTextureFb(int fbId) {
 void GfxRenderingAPICitro3D::DeleteTexture(uint32_t texId) {
     // This frame's recorded draws, and the GPU's last frame, may still use it: free it once both
     // are done. Texture ids are never reused, so nothing selects it again.
-    if (texId < mTextures.size() && mTextures[texId].tex != nullptr) {
-        mTexturesToFree.push_back(texId);
+    if (texId < mRecTextureCount) {
+        mRec->deleted.push_back(texId);
     }
 }
 
@@ -1706,7 +1845,7 @@ ImTextureID GfxRenderingAPICitro3D::GetTextureById(int id) {
 }
 
 void GfxRenderingAPICitro3D::SetCurrentPrimDepth(float depth) {
-    if (!mReplaying) {
+    if (!tReplaying) {
         Record(OpType::PrimDepth).value = depth;
         return;
     }

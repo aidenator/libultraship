@@ -163,6 +163,8 @@ void Update3dsStatusFps(float fps) {
     ConsoleRow(16, "\x1b[32m", text);
 }
 
+volatile uint64_t g3dsVBlankWaitTicks = 0;
+
 void Update3dsStatusNote(const char* text) {
     if (sStatusScreenUp) {
         ConsoleRow(18, "\x1b[33m", text);
@@ -293,7 +295,9 @@ void GfxWindowBackend3DS::SwapBuffersBegin() {
     // GPU finishes this one beats waiting for another.
     if (mTargetFps >= 60) {
         if (C3D_FrameCounter(0) == mLastPresentVBlank) {
+            const uint64_t waitStart = svcGetSystemTick();
             gspWaitForVBlank();
+            g3dsVBlankWaitTicks += svcGetSystemTick() - waitStart;
         }
         mLastPresentVBlank = C3D_FrameCounter(0);
     }

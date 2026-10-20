@@ -3,7 +3,9 @@
 
 #include "gfx_rendering_api.h"
 
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 #include <imgui.h>
@@ -144,9 +146,10 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void DrawRun(const float* buf, size_t firstTri, size_t numTris, int primaryRgb, int primaryAlpha);
     void SubmitDraws();
 
-    // Deferred drawing. During a frame the interpreter's calls are only recorded, while the GPU
-    // is still drawing the previous frame; EndFrame waits for the GPU and replays them, running the
-    // same methods for real. Texture uploads happen at once (waiting for the GPU first).
+    // Deferred drawing. During a frame the interpreter's calls are only recorded; at the frame's
+    // end a replay runs the same methods for real, waits for the GPU to finish the previous frame
+    // and sends this one. On a New 3DS the replay runs on its own thread, while the interpreter
+    // records the next frame; otherwise EndFrame replays. Only the replay calls citro3d.
     enum class OpType : uint8_t {
         LoadShader,
         SelectTexture,
@@ -162,6 +165,8 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
         DrawToFramebuffer,
         CopyFramebuffer,
         Clear,
+        Upload,
+        FramebufferSize,
     };
     struct Op {
         OpType type;
@@ -169,9 +174,26 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
         float value;
         ShaderProgram* shader;
     };
+    // One frame's recorded calls
+    struct FrameRecord {
+        std::vector<Op> ops;
+        std::vector<float> floats;    // the vertices of the draws
+        std::vector<uint8_t> pixels;  // the RGBA32 images of the uploads
+        std::vector<uint32_t> deleted; // textures deleted this frame
+        uint64_t recordTicks = 0;     // the interpreter's time on it
+        uint64_t handoffWaitTicks = 0; // the interpreter waiting for the last replay to finish
+        uint64_t gapTicks = 0;        // the renderer thread between the last frame's end and this one's start
+        uint64_t vblankWaitTicks = 0; // of that, waiting for vblank
+        uint32_t textureCount = 0;    // ids handed out by the frame's end
+        int framebufferCount = 1;
+    };
     Op& Record(OpType type);
     void BeginGpuFrame();
-    void Replay();
+    void Replay(FrameRecord& frame);
+    void FinishFrame(FrameRecord& frame);
+    void ReplayLoop();
+    void UploadTextureNow(uint32_t texId, const uint8_t* rgba32Buf, uint32_t width, uint32_t height);
+    void SetFramebufferSize(int fbId, uint32_t width, uint32_t height);
     void UpdateGpuTest();
     void BindUnit(int unit, void* tex);
     void ApplyTextureUnits(const Citro3D::TevProgram& program);
@@ -199,14 +221,21 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     float* mVbo = nullptr; // linear memory, refilled every frame
     size_t mVboUsed = 0;   // vertices
     uint32_t mDrawsSinceSubmit = 0; // draws still in the command list, not yet sent to the GPU
-    std::vector<Op> mOps;           // this frame's recorded calls
-    std::vector<float> mOpFloats;   // the vertices of the recorded draws
-    bool mReplaying = false;
-    bool mGpuFrameBegun = false;    // waited for the GPU this frame
+    FrameRecord mFrames[2];
+    FrameRecord* mRec = &mFrames[0]; // being recorded; the other one is being replayed
     int mRecSelectedUnit = 0;       // the texture the game last selected, as it records
     uint32_t mRecBoundTexture[2] = { 0, 0 };
-    std::vector<uint32_t> mTexturesToFree;  // deleted this frame
+    uint32_t mRecTextureCount = 0;  // ids handed out; the replay grows mTextures to match
+    int mRecFramebufferCount = 1;
     std::vector<uint32_t> mTexturesFreeable; // deleted before the frame the GPU is drawing
+
+    // The replay thread, if there is one
+    void* mReplayThread = nullptr;
+    std::mutex mReplayMutex;
+    std::condition_variable mReplayCv;
+    FrameRecord* mReplayFrame = nullptr; // handed to the thread, until it is done with it
+    bool mReplayQuit = false;
+    volatile uint32_t* mPhase = &gRenderPhase; // where the replay reports its phase to the profiler
     size_t mVboSubmitted = 0;       // vertices already flushed from the CPU cache for the GPU
     bool mVboFullReported = false;
 
@@ -244,6 +273,12 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     uint64_t mDrawTicksTotal = 0; // since the last summary
     uint64_t mDrawTicksMax = 0;
     uint64_t mWaitTicksTotal = 0;
+    uint64_t mReplayTicksTotal = 0;
+    uint64_t mHandoffTicksTotal = 0;
+    uint64_t mGapTicksTotal = 0;
+    uint64_t mVBlankTicksTotal = 0;
+    uint64_t mMainEndTick = 0;        // when the renderer thread's EndFrame returned
+    uint64_t mVBlankWaitAtEnd = 0;
     uint64_t mLastFrameEndTick = 0;
     uint64_t mUploadTicks = 0;
     uint32_t mFilesReadAtFrameEnd = 0;

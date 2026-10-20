@@ -609,6 +609,7 @@ enum RenderPhase : uint32_t {
     RENDER_PHASE_BACKEND_VERTICES,     // the backend: converting vertices
     RENDER_PHASE_BACKEND_DRAW,         // the backend: the draw call itself
     RENDER_PHASE_BACKEND_SUBMIT,       // the backend: sending a batch to the GPU
+    RENDER_PHASE_TRI_STATE,            // a triangle working out the render state after a change
     RENDER_PHASE_COUNT
 };
 extern volatile uint32_t gRenderPhase;

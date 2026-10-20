@@ -34,6 +34,8 @@ void Update3dsStatusFps(float fps);
 
 /// Shows a line of text under the frame rate on the status screen (if it is up)
 void Update3dsStatusNote(const char* text);
+// Time the renderer has spent waiting for vblank before presenting, in system ticks
+extern volatile uint64_t g3dsVBlankWaitTicks;
 
 /**
  * @brief Window backend for the Nintendo 3DS.
