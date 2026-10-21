@@ -96,6 +96,7 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void SetScissor(int x, int y, int width, int height) override;
     void SetUseAlpha(bool useAlpha) override;
     void DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) override;
+    float* GetVertexBuffer(size_t floats) override;
     void Init() override;
     void OnResize() override;
     void StartFrame() override;
@@ -174,10 +175,21 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
         float value;
         ShaderProgram* shader;
     };
+    // A growing array of floats that, unlike a vector, does not clear what it grows into
+    struct FloatArena {
+        float* data = nullptr;
+        size_t size = 0;
+        size_t capacity = 0;
+        FloatArena() = default;
+        FloatArena(const FloatArena&) = delete;
+        FloatArena& operator=(const FloatArena&) = delete;
+        ~FloatArena();
+        bool Reserve(size_t extra); // room for `extra` more; false when out of memory
+    };
     // One frame's recorded calls
     struct FrameRecord {
         std::vector<Op> ops;
-        std::vector<float> floats;    // the vertices of the draws
+        FloatArena floats;            // the vertices of the draws, written there by the interpreter
         std::vector<uint8_t> pixels;  // the RGBA32 images of the uploads
         std::vector<uint32_t> deleted; // textures deleted this frame
         uint64_t recordTicks = 0;     // the interpreter's time on it

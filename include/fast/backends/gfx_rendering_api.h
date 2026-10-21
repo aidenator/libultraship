@@ -49,6 +49,11 @@ class GfxRenderingAPI {
     virtual void SetScissor(int x, int y, int width, int height) = 0;
     virtual void SetUseAlpha(bool useAlpha) = 0;
     virtual void DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) = 0;
+    // Where the interpreter writes its next batch of vertices, room for at least `floats`, or nullptr
+    // for its own buffer. A backend that keeps the vertices to draw later saves copying them.
+    virtual float* GetVertexBuffer(size_t floats) {
+        return nullptr;
+    }
     virtual void Init() = 0;
     virtual void OnResize() = 0;
     virtual void StartFrame() = 0;

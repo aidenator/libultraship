@@ -415,6 +415,7 @@ class Interpreter {
     void GetCurDimensions(uint32_t* width, uint32_t* height);
 
     // private: TODO make these private
+    void NextVertexBuffer();
     void Flush();
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
@@ -553,7 +554,8 @@ class Interpreter {
 
     unsigned int mMsaaLevel = 1;
     bool mDroppedFrame{};
-    float* mBufVbo; // 3 vertices in a triangle and 32 floats per vtx
+    float* mBufVbo;    // where the batch is written: mOwnBufVbo, or the rendering API's buffer
+    float* mOwnBufVbo; // 3 vertices in a triangle and 32 floats per vtx
     size_t mBufVboLen{};
     size_t mBufVboNumTris{};
     GfxWindowBackend* mWapi = nullptr;

@@ -123,13 +123,14 @@ constexpr size_t MAX_TRI_BUFFER = 256;
 Interpreter::Interpreter() {
     mRsp = new RSP();
     mRdp = new RDP();
-    mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
+    mOwnBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
+    mBufVbo = mOwnBufVbo;
 }
 
 Interpreter::~Interpreter() {
     delete mRsp;
     delete mRdp;
-    delete[] mBufVbo;
+    delete[] mOwnBufVbo;
 }
 
 static std::weak_ptr<Interpreter> mInstance;
@@ -166,7 +167,13 @@ void Interpreter::Flush() {
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
+        NextVertexBuffer();
     }
+}
+
+void Interpreter::NextVertexBuffer() {
+    float* buf = mRapi->GetVertexBuffer(MAX_TRI_BUFFER * (32 * 3));
+    mBufVbo = buf != nullptr ? buf : mOwnBufVbo;
 }
 
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
@@ -1836,22 +1843,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     const uint32_t cull_back = get_attr(CULL_BACK);
 
     if ((mRsp->geometry_mode & cull_both) != 0) {
-        float invW1 = 1.0f / v1->w;
-        float invW2 = 1.0f / v2->w;
-        float invW3 = 1.0f / v3->w;
-        float x2 = v2->x * invW2;
-        float y2 = v2->y * invW2;
-        float dx1 = v1->x * invW1 - x2;
-        float dy1 = v1->y * invW1 - y2;
-        float dx2 = v3->x * invW3 - x2;
-        float dy2 = v3->y * invW3 - y2;
-        float cross = dx1 * dy2 - dy1 * dx2;
-
-        if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
-            // If one vertex lies behind the eye, negating cross will give the correct result.
-            // If all vertices lie behind the eye, the triangle will be rejected anyway.
-            cross = -cross;
-        }
+        // The facing, from the determinant of the clip-space (x, y, w) rows: it has the sign of the
+        // screen-space cross product times w1 w2 w3, so there is nothing to divide, and the sign of w
+        // (a vertex behind the eye) comes out of it too. Negated to match (v1 - v2) x (v3 - v2).
+        float cross = -(v1->x * (v2->y * v3->w - v3->y * v2->w) - v1->y * (v2->x * v3->w - v3->x * v2->w) +
+                        v1->w * (v2->x * v3->y - v3->x * v2->y));
 
         // G_EX_INVERT_CULLING is a LUS extension, not tied to a specific ucode,
         // so apply it regardless of the active microcode handler.
@@ -5241,6 +5237,7 @@ void Interpreter::RunGuiOnly() {
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
+    NextVertexBuffer(); // the last frame's has been handed over
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;
@@ -5286,6 +5283,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
+    NextVertexBuffer(); // the last frame's has been handed over
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;

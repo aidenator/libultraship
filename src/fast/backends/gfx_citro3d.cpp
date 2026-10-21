@@ -1228,14 +1228,47 @@ void GfxRenderingAPICitro3D::SubmitDraws() {
     *mPhase = prevPhase;
 }
 
+GfxRenderingAPICitro3D::FloatArena::~FloatArena() {
+    free(data);
+}
+
+bool GfxRenderingAPICitro3D::FloatArena::Reserve(size_t extra) {
+    if (size + extra <= capacity) {
+        return true;
+    }
+    const size_t newCapacity = std::max({ capacity * 2, size + extra, (size_t)256 * 1024 });
+    float* grown = (float*)realloc(data, newCapacity * sizeof(float));
+    if (grown == nullptr) {
+        return false;
+    }
+    data = grown;
+    capacity = newCapacity;
+    return true;
+}
+
+float* GfxRenderingAPICitro3D::GetVertexBuffer(size_t floats) {
+    // The interpreter writes each batch straight into the frame's record, so the draw needs no copy
+    FloatArena& arena = mRec->floats;
+    return arena.Reserve(floats) ? arena.data + arena.size : nullptr;
+}
+
 void GfxRenderingAPICitro3D::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
     if (!tReplaying) {
-        // The interpreter reuses its buffer, so keep a copy for the replay
+        // Keep the vertices for the replay: the interpreter wrote them into the record (see
+        // GetVertexBuffer) unless it had to use its own buffer
+        FloatArena& floats = mRec->floats;
+        if (buf_vbo != floats.data + floats.size) {
+            // Not written where GetVertexBuffer said: keep a copy
+            if (!floats.Reserve(buf_vbo_len)) {
+                return;
+            }
+            memcpy(floats.data + floats.size, buf_vbo, buf_vbo_len * sizeof(float));
+        }
         Op& op = Record(OpType::Draw);
-        op.args[0] = (int)mRec->floats.size();
+        op.args[0] = (int)floats.size;
         op.args[1] = (int)buf_vbo_len;
         op.args[2] = (int)buf_vbo_num_tris;
-        mRec->floats.insert(mRec->floats.end(), buf_vbo, buf_vbo + buf_vbo_len);
+        floats.size += buf_vbo_len;
         return;
     }
     ShaderProgram* prg = mCurrentShader;
@@ -1472,7 +1505,7 @@ void GfxRenderingAPICitro3D::Replay(FrameRecord& frame) {
                 SetCurrentPrimDepth(op.value);
                 break;
             case OpType::Draw:
-                DrawTriangles(frame.floats.data() + a[0], (size_t)a[1], (size_t)a[2]);
+                DrawTriangles(frame.floats.data + a[0], (size_t)a[1], (size_t)a[2]);
                 break;
             case OpType::DrawToFramebuffer:
                 StartDrawToFramebuffer(a[0], 1.0f);
@@ -1571,7 +1604,7 @@ void GfxRenderingAPICitro3D::EndFrame() {
         mReplayCv.notify_all();
     }
     mRec->ops.clear();
-    mRec->floats.clear();
+    mRec->floats.size = 0;
     mRec->pixels.clear();
     mRec->deleted.clear();
     mRec->handoffWaitTicks = 0;
