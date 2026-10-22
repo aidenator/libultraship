@@ -40,6 +40,14 @@ void Set3dsLoadProgress(float fraction, const char* step);
  */
 void Show3dsStatusScreen(const char* title, const char* version);
 
+/**
+ * @brief Shows an error on the bottom screen until START is pressed, then exits.
+ *
+ * For problems the player has to fix, such as a missing file: title says what's wrong and message
+ * how to fix it ('\n' starts a new line; long lines wrap at spaces).
+ */
+[[noreturn]] void Show3dsFatalError(const char* title, const char* message);
+
 /// Sets one of the status screen's 14 lines; a line starting with '*' is a heading
 void Update3dsStatusLine(int index, const char* text);
 

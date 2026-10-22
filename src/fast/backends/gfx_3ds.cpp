@@ -286,6 +286,66 @@ void Show3dsStatusScreen(const char* title, const char* version) {
     ConsoleRow(kHintRow, "\x1b[2m", "START + SELECT to quit");
 }
 
+void Show3dsFatalError(const char* title, const char* message) {
+    printf("%s: %s\n", title, message);
+    if (sConsoleDevice != nullptr) {
+        if (!sLoadingScreenUp && !sStatusScreenUp) {
+            TakeStdout(LoadingWrite);
+        }
+        // Nothing else may draw on the screen now
+        sLoadingScreenUp = false;
+        sStatusScreenUp = false;
+        for (int row = kVersionRow + 1; row < 30; row++) {
+            ConsoleRow(row, "", "");
+        }
+        ConsoleRow(8, "\x1b[31;1m", title);
+
+        // The message, wrapped at spaces to fit the screen with a margin
+        constexpr int kWidth = 36;
+        int row = 11;
+        const char* rest = message;
+        while (*rest != '\0' && row < kHintRow - 1) {
+            int length = std::min((int)strlen(rest), kWidth);
+            const char* newline = (const char*)memchr(rest, '\n', length);
+            if (newline != nullptr) {
+                length = (int)(newline - rest);
+            } else if (rest[length] != '\0') {
+                for (int i = length; i > 0; i--) {
+                    if (rest[i] == ' ') {
+                        length = i;
+                        break;
+                    }
+                }
+            }
+            char line[kWidth + 1];
+            snprintf(line, sizeof(line), "%.*s", length, rest);
+            ConsoleRow(row++, "", line);
+            rest += length;
+            if (*rest == ' ' || *rest == '\n') {
+                rest++;
+            }
+        }
+        ConsoleRow(kHintRow, "\x1b[2m", "Press START to exit");
+
+        // The console draws with the CPU; make sure the screen sees it
+        u16 width = 0;
+        u16 height = 0;
+        u8* framebuffer = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &width, &height);
+        GSPGPU_FlushDataCache(framebuffer, width * height * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_BOTTOM)));
+    }
+    while (aptMainLoop()) {
+        hidScanInput();
+        if (hidKeysDown() & KEY_START) {
+            break;
+        }
+        gspWaitForVBlank();
+    }
+    // As in GfxWindowBackend3DS::Destroy: stop SDL's audio before the program's memory goes away
+    SDL_Quit();
+    gfxExit();
+    exit(1);
+}
+
 void Update3dsStatusLine(int index, const char* text) {
     static char sShown[kStatusLineCount][48];
     if (!sStatusScreenUp || index < 0 || index >= kStatusLineCount || strncmp(sShown[index], text, 47) == 0) {

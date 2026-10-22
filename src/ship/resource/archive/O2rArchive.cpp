@@ -186,6 +186,11 @@ zip_t* O2rArchive::GetZipHandle() {
     // for a large archive on the 3DS, and its SD card serves one read at a time anyway: every
     // reader waits its turn for the handle Open made
     {
+        // An archive that failed to open has no handle to share; callers give up on nullptr
+        // without releasing it, so don't mark it busy
+        if (mZipArchive == nullptr) {
+            return nullptr;
+        }
         std::unique_lock<std::mutex> lock(mPoolMutex);
         mZipArchiveFree.wait(lock, [this] { return !mZipArchiveBusy; });
         mZipArchiveBusy = true;
