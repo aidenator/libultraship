@@ -48,6 +48,12 @@ extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* at
     return __real_pthread_create(thread, &sized, start, arg);
 }
 
+// SDL's main() mounts the app's romfs before calling SDL_main. The app has no romfs (everything is
+// read from sdmc:/3ds/lighthouse), but looking for one still takes about a second, so skip it.
+extern "C" Result __wrap_romfsMountSelf(const char* name) {
+    return MAKERESULT(RL_PERMANENT, RS_NOTFOUND, RM_ROMFS, RD_NOT_FOUND);
+}
+
 namespace Fast {
 
 void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core) {
@@ -83,21 +89,33 @@ void Join3dsThread(void* thread) {
     threadFree((Thread)thread);
 }
 
-// The console's own output device, kept so the status screen can draw after stdout moves away
+// The console's own output device, kept so the bottom screen can draw after stdout moves away
 static const devoptab_t* sConsoleDevice = nullptr;
+// Where stdout went before the loading screen took it: the 3dslink host, or nothing
+static const devoptab_t* sStdoutDevice = nullptr;
 static bool sStdoutToHost = false;
+static LightLock sConsoleLock;
+static bool sLoadingScreenUp = false;
 static bool sStatusScreenUp = false;
 static int sShownFps = -1;
+static int sShownBarCells = -1;
+static uint64_t sStartTick = 0;
+// When the screens were up and when stdout reached the 3dslink host, for the startup log
+static uint64_t sScreensTick = 0;
+static uint64_t sLinkTick = 0;
 
 // Bring up the screens and the bottom-screen console before main(), so output from startup
 // (spdlog's default logger writes to stdout until the game configures logging) is visible.
 static struct EarlyConsole {
     EarlyConsole() {
+        sStartTick = svcGetSystemTick();
+        LightLock_Init(&sConsoleLock);
         // New 3DS: 804 MHz and the extra L2 cache (no effect on older models)
         osSetSpeedupEnable(true);
         gfxInitDefault();
         consoleInit(GFX_BOTTOM, nullptr);
         sConsoleDevice = devoptab_list[STD_OUT];
+        sScreensTick = svcGetSystemTick();
 
         // Started with `3dslink -s`: send stdout and stderr to the host's terminal instead
         if (__3dslink_host.s_addr != 0) {
@@ -108,6 +126,7 @@ static struct EarlyConsole {
                 if (link3dsStdio() >= 0) {
                     setvbuf(stdout, nullptr, _IOLBF, 0);
                     sStdoutToHost = true;
+                    sLinkTick = svcGetSystemTick();
                 }
             }
         }
@@ -119,37 +138,166 @@ static ssize_t DiscardWrite(struct _reent* r, void* fd, const char* ptr, size_t 
 }
 
 static void ConsoleWrite(const char* text) {
+    LightLock_Lock(&sConsoleLock);
     sConsoleDevice->write_r(_REENT, nullptr, text, strlen(text));
+    LightLock_Unlock(&sConsoleLock);
 }
 
 // Text centred on a row of the 40x30 console, replacing whatever the row held
 static void ConsoleRow(int row, const char* color, const char* text) {
-    char line[96];
-    const int column = std::max(0, (40 - (int)strlen(text)) / 2);
-    snprintf(line, sizeof(line), "\x1b[%d;1H\x1b[2K\x1b[%d;%dH%s%s\x1b[0m", row + 1, row + 1, column + 1, color,
-             text);
+    char line[128];
+    const int length = std::min((int)strlen(text), 40);
+    const int column = (40 - length) / 2;
+    snprintf(line, sizeof(line), "\x1b[%d;1H\x1b[2K\x1b[%d;%dH%s%.*s\x1b[0m", row + 1, row + 1, column + 1, color,
+             length, text);
     ConsoleWrite(line);
+}
+
+// Bottom-screen rows, counted from 0
+static constexpr int kTitleRow = 2;
+static constexpr int kVersionRow = 3;
+static constexpr int kLoadStepRow = 11;
+static constexpr int kBarRow = 13;
+static constexpr int kBarCells = 30;
+static constexpr int kLogRow = 16;
+static constexpr int kErrorRow = 19; // and the row under it
+static constexpr int kFirstStatusLine = 6;
+static constexpr int kStatusLineCount = 14;
+static constexpr int kFpsRow = 23;
+static constexpr int kNoteRow = 25;
+static constexpr int kHintRow = 28;
+
+// While loading, stdout lands here: the latest line shows under the bar, errors stay up in red
+static char sLogLine[160];
+static size_t sLogLength = 0;
+
+static void ShowLogLine(char* line) {
+    const bool isError = strstr(line, "[error]") != nullptr || strstr(line, "[critical]") != nullptr;
+    // Drop spdlog's "[time] [file:line] [level] " prefix
+    char* text = line;
+    for (char* close = strstr(text, "] "); close != nullptr; close = strstr(text, "] ")) {
+        text = close + 2;
+    }
+    // The step is already shown above the bar
+    if (*text == '\0' || strncmp(text, "Loading: ", 9) == 0) {
+        return;
+    }
+    if (isError) {
+        ConsoleRow(kErrorRow, "\x1b[31;1m", text);
+        ConsoleRow(kErrorRow + 1, "\x1b[31;1m", strlen(text) > 40 ? text + 40 : "");
+    } else {
+        ConsoleRow(kLogRow, "\x1b[2m", text);
+    }
+}
+
+static ssize_t LoadingWrite(struct _reent* r, void* fd, const char* ptr, size_t len) {
+    if (sStdoutDevice != nullptr && sStdoutDevice->write_r != nullptr) {
+        sStdoutDevice->write_r(r, fd, ptr, len);
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (ptr[i] == '\n' || sLogLength == sizeof(sLogLine) - 1) {
+            sLogLine[sLogLength] = '\0';
+            if (sLoadingScreenUp) {
+                ShowLogLine(sLogLine);
+            }
+            sLogLength = 0;
+        } else if (ptr[i] != '\r') {
+            sLogLine[sLogLength++] = ptr[i];
+        }
+    }
+    return len;
+}
+
+static void TakeStdout(ssize_t (*write)(struct _reent*, void*, const char*, size_t)) {
+    static devoptab_t device = {};
+    fflush(stdout);
+    fflush(stderr);
+    if (sStdoutDevice == nullptr) {
+        static devoptab_t discard = {};
+        discard.name = "discard";
+        discard.write_r = DiscardWrite;
+        sStdoutDevice = sStdoutToHost ? devoptab_list[STD_OUT] : &discard;
+    }
+    device = *sStdoutDevice;
+    device.name = "bottom";
+    device.write_r = write;
+    devoptab_list[STD_OUT] = &device;
+    devoptab_list[STD_ERR] = &device;
+}
+
+static void ShowTitle(const char* title, const char* version) {
+    ConsoleWrite("\x1b[2J");
+    ConsoleRow(kTitleRow, "\x1b[33;1m", title);
+    ConsoleRow(kVersionRow, "\x1b[2m", version);
+}
+
+void Show3dsLoadingScreen(const char* title, const char* version) {
+    if (sConsoleDevice == nullptr || sLoadingScreenUp || sStatusScreenUp) {
+        return;
+    }
+    TakeStdout(LoadingWrite);
+    sLoadingScreenUp = true;
+    ShowTitle(title, version);
+    const auto ms = [](uint64_t from, uint64_t to) { return (to - from) * 1000.0 / SYSCLOCK_ARM11; };
+    printf("Before main: screens %.0f ms, 3dslink %.0f ms, the rest %.0f ms\n", ms(sStartTick, sScreensTick),
+           sLinkTick != 0 ? ms(sScreensTick, sLinkTick) : 0.0,
+           ms(sLinkTick != 0 ? sLinkTick : sScreensTick, svcGetSystemTick()));
+    Set3dsLoadProgress(0.0f, "Starting");
+}
+
+void Set3dsLoadProgress(float fraction, const char* step) {
+    printf("Loading: %s (%.0f%%) at %.0f ms\n", step, fraction * 100.0f,
+           (svcGetSystemTick() - sStartTick) * 1000.0 / SYSCLOCK_ARM11);
+    if (!sLoadingScreenUp) {
+        return;
+    }
+    char text[48];
+    snprintf(text, sizeof(text), "%s...", step);
+    ConsoleRow(kLoadStepRow, "", text);
+
+    const int cells = std::clamp((int)(fraction * kBarCells + 0.5f), 0, kBarCells);
+    if (cells == sShownBarCells) {
+        return;
+    }
+    sShownBarCells = cells;
+    char bar[160];
+    char* out = bar + snprintf(bar, sizeof(bar), "\x1b[%d;%dH\x1b[47m", kBarRow + 1, (40 - kBarCells) / 2 + 1);
+    for (int i = 0; i < kBarCells; i++) {
+        if (i == cells) {
+            out += sprintf(out, "\x1b[44m");
+        }
+        *out++ = ' ';
+    }
+    strcpy(out, "\x1b[0m");
+    ConsoleWrite(bar);
 }
 
 void Show3dsStatusScreen(const char* title, const char* version) {
     if (sConsoleDevice == nullptr || sStatusScreenUp) {
         return;
     }
-    if (!sStdoutToHost) {
-        // Nothing else may write to the console now; the log file still gets everything
-        static devoptab_t discard = {};
-        discard.name = "discard";
-        discard.write_r = DiscardWrite;
-        fflush(stdout);
-        fflush(stderr);
-        devoptab_list[STD_OUT] = &discard;
-        devoptab_list[STD_ERR] = &discard;
+    if (!sLoadingScreenUp) {
+        TakeStdout(LoadingWrite);
     }
+    // From here on the log goes only to the 3dslink host (if any) and the log file
+    sLoadingScreenUp = false;
     sStatusScreenUp = true;
-    ConsoleWrite("\x1b[2J");
-    ConsoleRow(10, "\x1b[33;1m", title);
-    ConsoleRow(12, "", version);
-    ConsoleRow(27, "\x1b[2m", "START + SELECT to quit");
+    ShowTitle(title, version);
+    ConsoleRow(kHintRow, "\x1b[2m", "START + SELECT to quit");
+}
+
+void Update3dsStatusLine(int index, const char* text) {
+    static char sShown[kStatusLineCount][48];
+    if (!sStatusScreenUp || index < 0 || index >= kStatusLineCount || strncmp(sShown[index], text, 47) == 0) {
+        return;
+    }
+    snprintf(sShown[index], sizeof(sShown[index]), "%s", text);
+    // A line starting with '*' is a heading
+    if (text[0] == '*') {
+        ConsoleRow(kFirstStatusLine + index, "\x1b[36;1m", text + 1);
+    } else {
+        ConsoleRow(kFirstStatusLine + index, "", text);
+    }
 }
 
 void Update3dsStatusFps(float fps) {
@@ -160,14 +308,14 @@ void Update3dsStatusFps(float fps) {
     sShownFps = rounded;
     char text[16];
     snprintf(text, sizeof(text), "%d fps", rounded);
-    ConsoleRow(16, "\x1b[32m", text);
+    ConsoleRow(kFpsRow, "\x1b[32m", text);
 }
 
 volatile uint64_t g3dsVBlankWaitTicks = 0;
 
 void Update3dsStatusNote(const char* text) {
     if (sStatusScreenUp) {
-        ConsoleRow(18, "\x1b[33m", text);
+        ConsoleRow(kNoteRow, "\x1b[33m", text);
     }
 }
 

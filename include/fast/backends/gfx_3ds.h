@@ -21,13 +21,27 @@ void Join3dsThread(void* thread);
 bool Is3dsNew();
 
 /**
- * @brief Turns the bottom screen from the startup log into a status screen.
+ * @brief Turns the bottom screen from the startup log into a loading screen.
  *
- * Until this is called, the bottom screen shows stdout, so startup problems are readable on the
- * device. Afterwards it shows the title, version and frame rate, and stdout goes only to a
- * 3dslink host (if one is connected) and the log file.
+ * Until this is called, the bottom screen shows stdout. Afterwards it shows the title, version, a
+ * progress bar (see Set3dsLoadProgress) and the latest log line, with errors kept up in red.
+ * stdout still reaches a 3dslink host, if one is connected.
+ */
+void Show3dsLoadingScreen(const char* title, const char* version);
+
+/// Moves the loading bar to fraction (0 to 1) and names the step under way; also logs the time
+void Set3dsLoadProgress(float fraction, const char* step);
+
+/**
+ * @brief Turns the bottom screen into a status screen, once loading is done.
+ *
+ * It shows the title, version, lines of game status (see Update3dsStatusLine) and the frame rate.
+ * stdout then goes only to a 3dslink host (if one is connected) and the log file.
  */
 void Show3dsStatusScreen(const char* title, const char* version);
+
+/// Sets one of the status screen's 14 lines; a line starting with '*' is a heading
+void Update3dsStatusLine(int index, const char* text);
 
 /// Shows a new frame rate on the status screen (if it is up). Call from the render thread.
 void Update3dsStatusFps(float fps);
@@ -41,7 +55,7 @@ extern volatile uint64_t g3dsVBlankWaitTicks;
  * @brief Window backend for the Nintendo 3DS.
  *
  * The game draws to the 400x240 top screen; the bottom screen is a text console that shows
- * stdout during startup, then a status screen (see Show3dsStatusScreen). Input and audio stay with SDL2, which this
+ * stdout during startup, then a loading and a status screen (see Show3dsLoadingScreen). Input and audio stay with SDL2, which this
  * backend pumps each frame. There is no keyboard, mouse or windowing, so those calls do nothing.
  */
 class GfxWindowBackend3DS final : public GfxWindowBackend {

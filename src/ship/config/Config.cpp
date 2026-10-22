@@ -206,15 +206,22 @@ void Config::Reload() {
     try {
         mNestedJson = nlohmann::json::parse(ifs);
         mFlattenedJson = mNestedJson.flatten();
+        mSavedJson = mFlattenedJson;
     } catch (const nlohmann::json::exception& e) {
         SPDLOG_ERROR("Failed to parse config file {}: {}", mPath, e.what());
     } catch (const std::exception& e) { SPDLOG_ERROR("Unexpected error loading config file {}: {}", mPath, e.what()); }
 }
 
 void Config::Save() {
+    // Settings are saved on every change, often with nothing changed (startup saves several times).
+    // Skip those: a write to a slow SD card can take over a second.
+    if (mFlattenedJson == mSavedJson) {
+        return;
+    }
     std::ofstream file(mPath);
     mNestedJson = mFlattenedJson.unflatten();
     file << mNestedJson.dump(4);
+    mSavedJson = mFlattenedJson;
 }
 
 template <typename T> std::vector<T> Config::GetArray(const std::string& key) {

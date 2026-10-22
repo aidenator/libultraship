@@ -228,6 +228,8 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Nintendo3DS")
     target_link_libraries(libultraship PRIVATE fast3d_shader_bin)
     # Raise the 32 KB default thread stack (see __wrap_pthread_create in gfx_3ds.cpp)
     target_link_options(libultraship INTERFACE -Wl,--wrap=pthread_create)
+    # Skip SDL's romfs mount before SDL_main (see __wrap_romfsMountSelf in gfx_3ds.cpp)
+    target_link_options(libultraship INTERFACE -Wl,--wrap=romfsMountSelf)
 else()
     target_compile_definitions(libultraship PRIVATE
         ENABLE_OPENGL

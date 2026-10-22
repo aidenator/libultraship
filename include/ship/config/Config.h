@@ -228,6 +228,7 @@ class Config {
   private:
     nlohmann::json mFlattenedJson;
     nlohmann::json mNestedJson;
+    nlohmann::json mSavedJson; // what the file holds, as of the last load or save
     std::string mPath;
     bool mIsNewInstance;
     std::map<uint32_t, std::shared_ptr<ConfigVersionUpdater>> mVersionUpdaters;
