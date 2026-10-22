@@ -57,9 +57,7 @@ extern "C" Result __wrap_romfsMountSelf(const char* name) {
 namespace Fast {
 
 void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core) {
-    bool isNew3ds = false;
-    APT_CheckNew3DS(&isNew3ds);
-    if (core >= 2 && !isNew3ds) {
+    if (core >= 2 && !Is3dsNew()) {
         return nullptr;
     }
     // Core 1 is the system's, and an app may only use the share of it the system grants. 80% is
@@ -79,9 +77,13 @@ void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core) {
 }
 
 bool Is3dsNew() {
+#ifdef LH_3DS_SIMULATE_OLD
+    return false;
+#else
     bool isNew3ds = false;
     APT_CheckNew3DS(&isNew3ds);
     return isNew3ds;
+#endif
 }
 
 void Join3dsThread(void* thread) {
@@ -111,7 +113,9 @@ static struct EarlyConsole {
         sStartTick = svcGetSystemTick();
         LightLock_Init(&sConsoleLock);
         // New 3DS: 804 MHz and the extra L2 cache (no effect on older models)
+#ifndef LH_3DS_SIMULATE_OLD
         osSetSpeedupEnable(true);
+#endif
         gfxInitDefault();
         consoleInit(GFX_BOTTOM, nullptr);
         sConsoleDevice = devoptab_list[STD_OUT];
@@ -235,6 +239,10 @@ void Show3dsLoadingScreen(const char* title, const char* version) {
     if (sConsoleDevice == nullptr || sLoadingScreenUp || sStatusScreenUp) {
         return;
     }
+#ifdef LH_3DS_SIMULATE_OLD
+    // SDL's main() turns the New 3DS speed-up on before SDL_main; turn it back off
+    osSetSpeedupEnable(false);
+#endif
     TakeStdout(LoadingWrite);
     sLoadingScreenUp = true;
     ShowTitle(title, version);
@@ -381,9 +389,11 @@ void Update3dsStatusNote(const char* text) {
 
 void GfxWindowBackend3DS::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
                                uint32_t height, int32_t posX, int32_t posY) {
-    bool isNew3ds = false;
-    APT_CheckNew3DS(&isNew3ds);
-    printf("%s (%s) on %s 3DS\n", gameName, apiName, isNew3ds ? "New" : "Old");
+#ifdef LH_3DS_SIMULATE_OLD
+    printf("%s (%s) on a New 3DS run as an Old 3DS\n", gameName, apiName);
+#else
+    printf("%s (%s) on %s 3DS\n", gameName, apiName, Is3dsNew() ? "New" : "Old");
+#endif
     printf("heap %lu KB, linear %lu KB free\n", (unsigned long)(envGetHeapSize() / 1024),
            (unsigned long)(linearSpaceFree() / 1024));
 

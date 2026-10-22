@@ -1401,8 +1401,9 @@ void GfxRenderingAPICitro3D::Init() {
     C3D_CullFace(GPU_CULL_NONE);
     mStatsTick = svcGetSystemTick();
 
-    // The profiler shares core 1 with the audio; on an Old 3DS, or without core 1, it just doesn't run
-    if (Start3dsThreadOnCore(SamplePhases, nullptr, 1) == nullptr) {
+    // The profiler shares core 1 with the audio. An Old 3DS has no time to spare there, so it only
+    // runs on a New 3DS
+    if (!Is3dsNew() || Start3dsThreadOnCore(SamplePhases, nullptr, 1) == nullptr) {
         printf("No renderer profiler\n");
     }
 
