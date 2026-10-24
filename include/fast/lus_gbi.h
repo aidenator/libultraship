@@ -211,6 +211,9 @@ constexpr int8_t RDP_G_SETTILESIZE_LERP = OPCODE(0x4a);
  */
 #define G_EX_INVERT_CULLING 0x00000001
 #define G_EX_ALWAYS_EXECUTE_BRANCH 0x00000002
+// Stereoscopic 3D: measure depth against a camera of the game's own, close to what it shows,
+// rather than the world's camera, such as the jigsaw level transition's
+#define G_EX_STEREO_OWN_CAMERA 0x00000004
 
 /*
  * G_SETIMG fmt: set image formats

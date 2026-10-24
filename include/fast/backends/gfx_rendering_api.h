@@ -84,6 +84,9 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+    // Whether the next triangles are seen by a camera of the game's own (G_EX_STEREO_OWN_CAMERA)
+    virtual void SetStereoOwnCamera(bool ownCamera) {
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

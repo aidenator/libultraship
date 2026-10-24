@@ -616,6 +616,10 @@ enum RenderPhase : uint32_t {
 };
 extern volatile uint32_t gRenderPhase;
 
+// How far past the screen's left and right edges a vertex may be before its triangles are dropped,
+// as a multiple of w. Above 1 when stereoscopic 3D shifts each eye's view sideways.
+extern float gClipScaleX;
+
 struct RenderPhaseScope {
     uint32_t prev;
     explicit RenderPhaseScope(uint32_t phase) : prev(gRenderPhase) {

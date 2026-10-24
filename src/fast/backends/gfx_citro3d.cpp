@@ -29,6 +29,11 @@
      GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) |                \
      GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO))
 
+// citro3d's context, whose first member is its GPU command queue (source/internal.h in citro3d
+// 1.7.1). citro3d runs the queue only from the frame's end; starting it after the left eye lets the
+// GPU draw that eye while the right one is built (see Replay).
+extern "C" gxCmdQueue_s __C3D_Context;
+
 namespace Fast {
 
 using namespace Citro3D;
@@ -141,6 +146,27 @@ constexpr size_t kVboBytes = 1536 * 1024;
 constexpr size_t kVboVertices = kVboBytes / (kVertexFloats * sizeof(float));
 
 constexpr int kFogRampWidth = 256;
+
+// Stereoscopic 3D at full slider: how far each eye's view of a distant point moves, as a share of
+// half the screen's width (0.03 is 6 pixels), and how far out of the screen a close-up may come,
+// as a multiple of that
+constexpr float kMaxEyeShift = 0.03f;
+constexpr float kPopOutCap = 1.0f;
+// The convergence distance for G_EX_STEREO_OWN_CAMERA draws: the jigsaw transition's picture is at
+// w = 150 (measured), so it starts at the screen's depth; its pieces fly in to about 50
+constexpr float kOwnCameraConvergence = 150.0f;
+
+// VRAM kept free for offscreen framebuffers' depth buffers, which are made when first drawn into
+constexpr size_t kVramReserve = 1536 * 1024;
+// Each VRAM upload is a copy in citro3d's GPU command queue, which holds 32 entries; a frame's
+// clears, screen copies and transfers to the screens need the rest. A frame that loads a level
+// uploads far more: past this, textures go to linear memory.
+constexpr uint32_t kMaxVramUploadsPerFrame = 8;
+
+size_t TextureBytes(uint32_t width, uint32_t height, GPU_TEXCOLOR fmt) {
+    const size_t bits = fmt == GPU_RGBA8 ? 32 : (fmt == GPU_L8 || fmt == GPU_LA4) ? 8 : 16;
+    return (size_t)width * height * bits / 8;
+}
 
 // Offscreen framebuffers are textures that hold a 240x400 sideways image, like the screen's
 constexpr int kFbTexWidth = 256;
@@ -903,59 +929,94 @@ void GfxRenderingAPICitro3D::UploadTextureNow(uint32_t texId, const uint8_t* rgb
     }
     const GPU_TEXCOLOR fmt = ChooseTextureFormat((const uint32_t*)rgba32Buf, width * height);
     mTexturesByBits[fmt == GPU_RGBA8 ? 2 : (fmt == GPU_L8 || fmt == GPU_LA4) ? 0 : 1]++;
+    const bool canCopy = mVramUploads < kMaxVramUploadsPerFrame;
+    void* replaced = nullptr;
     if (t.tex != nullptr && (AsTex(t.tex)->width != texWidth || AsTex(t.tex)->height != texHeight ||
-                             AsTex(t.tex)->fmt != fmt)) {
-        C3D_TexDelete(AsTex(t.tex));
-        delete AsTex(t.tex);
+                             AsTex(t.tex)->fmt != fmt || (t.inVram && !canCopy))) {
+        // The last frame's draws used it: free it once the GPU is done
+        mTexObjectsFreeable.push_back(t.tex);
+        mVramTextures -= t.inVram ? 1 : 0;
+        replaced = t.tex;
         t.tex = nullptr;
     }
     if (t.tex == nullptr) {
-        t.tex = new C3D_Tex();
-        if (!C3D_TexInit(AsTex(t.tex), (u16)texWidth, (u16)texHeight, fmt)) {
+        // VRAM while it lasts: the GPU samples it faster than linear memory
+        C3D_Tex* tex = new C3D_Tex();
+        t.inVram = canCopy && vramSpaceFree() >= TextureBytes(texWidth, texHeight, fmt) + kVramReserve &&
+                   C3D_TexInitVRAM(tex, (u16)texWidth, (u16)texHeight, fmt);
+        if (!t.inVram && !C3D_TexInit(tex, (u16)texWidth, (u16)texHeight, fmt)) {
             printf("citro3d: out of memory for a %lux%lu texture\n", (unsigned long)texWidth,
                    (unsigned long)texHeight);
-            delete AsTex(t.tex);
-            t.tex = nullptr;
+            delete tex;
             return;
         }
-        C3D_TexSetFilter(AsTex(t.tex), GPU_LINEAR, GPU_LINEAR);
+        mVramTextures += t.inVram ? 1 : 0;
+        C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
+        t.tex = tex;
+        // A unit still holding the replaced texture takes the new one
+        for (int unit = 0; unit < 3; unit++) {
+            if (replaced != nullptr && mUnitTex[unit] == replaced) {
+                BindUnit(unit, tex);
+            }
+        }
     }
     t.scaleS = (float)width / (float)texWidth;
     t.scaleT = (float)height / (float)texHeight;
+
+    // The CPU writes a VRAM texture through a copy in linear memory, which the GPU's copy engine
+    // moves over in order with the draws
+    C3D_Tex* dst = AsTex(t.tex);
+    if (t.inVram) {
+        dst = new C3D_Tex();
+        if (!C3D_TexInit(dst, (u16)texWidth, (u16)texHeight, fmt)) {
+            printf("citro3d: out of memory for a %lux%lu texture upload\n", (unsigned long)texWidth,
+                   (unsigned long)texHeight);
+            delete dst;
+            return;
+        }
+    }
 
     // Swizzle into 8x8 tiles, converting each pixel to the texture's format
     const uint32_t* src = (const uint32_t*)rgba32Buf;
     switch (fmt) {
         case GPU_RGBA8:
             // RGBA bytes to the PICA's ABGR word order
-            SwizzleTiles<uint32_t>(src, width, height, texWidth, texHeight, AsTex(t.tex)->data,
+            SwizzleTiles<uint32_t>(src, width, height, texWidth, texHeight, dst->data,
                                    [](uint32_t c) { return __builtin_bswap32(c); });
             break;
         case GPU_RGBA5551:
-            SwizzleTiles<uint16_t>(src, width, height, texWidth, texHeight, AsTex(t.tex)->data, [](uint32_t c) {
+            SwizzleTiles<uint16_t>(src, width, height, texWidth, texHeight, dst->data, [](uint32_t c) {
                 return (uint16_t)(((R(c) >> 3) << 11) | ((G(c) >> 3) << 6) | ((B(c) >> 3) << 1) | (A(c) >> 7));
             });
             break;
         case GPU_RGBA4:
-            SwizzleTiles<uint16_t>(src, width, height, texWidth, texHeight, AsTex(t.tex)->data, [](uint32_t c) {
+            SwizzleTiles<uint16_t>(src, width, height, texWidth, texHeight, dst->data, [](uint32_t c) {
                 return (uint16_t)(((R(c) >> 4) << 12) | ((G(c) >> 4) << 8) | ((B(c) >> 4) << 4) | (A(c) >> 4));
             });
             break;
         case GPU_LA8:
-            SwizzleTiles<uint16_t>(src, width, height, texWidth, texHeight, AsTex(t.tex)->data,
+            SwizzleTiles<uint16_t>(src, width, height, texWidth, texHeight, dst->data,
                                    [](uint32_t c) { return (uint16_t)((R(c) << 8) | A(c)); });
             break;
         case GPU_LA4:
-            SwizzleTiles<uint8_t>(src, width, height, texWidth, texHeight, AsTex(t.tex)->data,
+            SwizzleTiles<uint8_t>(src, width, height, texWidth, texHeight, dst->data,
                                   [](uint32_t c) { return (uint8_t)(((R(c) >> 4) << 4) | (A(c) >> 4)); });
             break;
         case GPU_L8:
         default:
-            SwizzleTiles<uint8_t>(src, width, height, texWidth, texHeight, AsTex(t.tex)->data,
+            SwizzleTiles<uint8_t>(src, width, height, texWidth, texHeight, dst->data,
                                   [](uint32_t c) { return (uint8_t)R(c); });
             break;
     }
-    C3D_TexFlush(AsTex(t.tex));
+    C3D_TexFlush(dst);
+    if (dst != AsTex(t.tex)) {
+        // Uploads come before the frame's draws (see Replay), so the copy lands before all of
+        // them. The linear copy is freed once the GPU is done.
+        const u32 bytes = (u32)TextureBytes(texWidth, texHeight, fmt);
+        GX_TextureCopy((u32*)dst->data, 0, (u32*)AsTex(t.tex)->data, 0, bytes, GX_TRANSFER_RAW_COPY(1));
+        mTexObjectsFreeable.push_back(dst);
+        mVramUploads++;
+    }
     // The replay's SelectTexture binds it
 }
 
@@ -972,7 +1033,7 @@ void GfxRenderingAPICitro3D::SetSamplerParameters(int sampler, bool linear_filte
         return;
     }
     if (sampler == 0 && mBoundFramebuffer >= 0) {
-        C3D_Tex* fbTex = AsTex(mFramebuffers[mBoundFramebuffer].tex);
+        C3D_Tex* fbTex = AsTex(EyeTexture(mFramebuffers[mBoundFramebuffer]));
         const bool linear = linear_filter && mFilterMode != FILTER_NONE;
         C3D_TexSetFilter(fbTex, linear ? GPU_LINEAR : GPU_NEAREST, linear ? GPU_LINEAR : GPU_NEAREST);
         C3D_TexSetWrap(fbTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
@@ -1157,10 +1218,12 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
     }
     // A framebuffer bound as texture 0 is sampled in its own sideways layout
     const Framebuffer* fbTex = (texOff[0] >= 0 && mBoundFramebuffer >= 0) ? &mFramebuffers[mBoundFramebuffer] : nullptr;
+    ApplyEyeShift(first, fbTex != nullptr);
 
     *mPhase = RENDER_PHASE_BACKEND_VERTICES;
     float* dst = mVbo + mVboUsed * kVertexFloats;
-    for (size_t i = 0; i < numVerts; i++) {
+    // The second eye draws the same vertices, which the first eye wrote
+    for (size_t i = 0; i < (mSecondEye ? 0 : numVerts); i++) {
         const float* v = first + i * stride;
         const float x = v[0], y = v[1], z = v[2], w = v[3];
         // Rotate for the sideways screen; map z from [-w, w] to [-w, 0] (near to far)
@@ -1207,7 +1270,7 @@ void GfxRenderingAPICitro3D::DrawRun(const float* buf, size_t firstTri, size_t n
     }
     *mPhase = RENDER_PHASE_BACKEND;
     mVboUsed += numVerts;
-    mFrameDraws++;
+    mFrameDraws += mSecondEye ? 0 : 1;
     mDrawsSinceSubmit++;
 }
 
@@ -1223,7 +1286,8 @@ void GfxRenderingAPICitro3D::SubmitDraws() {
                                  (mVboUsed - mVboSubmitted) * kVertexFloats * sizeof(float));
         mVboSubmitted = mVboUsed;
     }
-    C3D_FrameSplit(0);
+    // Flush only this part of the command list for the GPU (see FinishFrame)
+    C3D_FrameSplit(GX_CMDLIST_FLUSH);
     mDrawsSinceSubmit = 0;
     *mPhase = prevPhase;
 }
@@ -1275,7 +1339,7 @@ void GfxRenderingAPICitro3D::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, 
     if (prg == nullptr || buf_vbo_num_tris == 0) {
         return;
     }
-    mFrameTris += buf_vbo_num_tris;
+    mFrameTris += mSecondEye ? 0 : buf_vbo_num_tris;
     const CCFeatures& cc = prg->cc;
     const int stride = prg->numFloats;
     const int inputFloats = cc.opt_alpha ? 4 : 3;
@@ -1356,11 +1420,19 @@ void GfxRenderingAPICitro3D::Init() {
     mTopTarget = C3D_RenderTargetCreate(kScreenHeight, kScreenWidth, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
     C3D_RenderTargetSetOutput(mTopTarget, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
     mCurrentTarget = mTopTarget;
+    mEyeTarget = mTopTarget;
+    mRightTarget = C3D_RenderTargetCreate(kScreenHeight, kScreenWidth, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+    if (mRightTarget != nullptr) {
+        C3D_RenderTargetSetOutput(mRightTarget, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
+    }
+    printf("3D %s, VRAM %lu KB free\n", mRightTarget != nullptr ? "ready" : "unavailable",
+           (unsigned long)(vramSpaceFree() / 1024));
 
     sShaderDvlb = DVLB_ParseFile((u32*)fast3d_shbin, fast3d_shbin_size);
     shaderProgramInit(&sShaderProgram);
     shaderProgramSetVsh(&sShaderProgram, &sShaderDvlb->DVLE[0]);
     C3D_BindProgram(&sShaderProgram);
+    mStereoUniform = shaderInstanceGetUniformLocation(sShaderProgram.vertexShader, "stereo");
 
     C3D_AttrInfo* attrInfo = C3D_GetAttrInfo();
     AttrInfo_Init(attrInfo);
@@ -1428,6 +1500,10 @@ void GfxRenderingAPICitro3D::OnResize() {
 void GfxRenderingAPICitro3D::StartFrame() {
     // Record this frame's drawing while the GPU is still busy with the last one
     mFrameStartTick = svcGetSystemTick();
+    // The 3D slider, read once per frame so the culling margin matches the frame's eye shift
+    const float eyeShift = mRightTarget != nullptr ? osGet3DSliderState() * kMaxEyeShift : 0.0f;
+    mRec->eyeShift = eyeShift;
+    gClipScaleX = 1.0f + eyeShift * std::max(1.0f, kPopOutCap) + 0.01f;
     if (mMainEndTick != 0) {
         mRec->gapTicks = mFrameStartTick - mMainEndTick;
         const uint64_t vblankWait = g3dsVBlankWaitTicks;
@@ -1445,34 +1521,126 @@ void GfxRenderingAPICitro3D::BeginGpuFrame() {
     mWaitTicksTotal += svcGetSystemTick() - beginTick;
     // The GPU is done with the last frame: free the textures deleted before it was sent
     for (uint32_t texId : mTexturesFreeable) {
+        mVramTextures -= mTextures[texId].inVram ? 1 : 0;
+        ForgetTexObject(mTextures[texId].tex);
         C3D_TexDelete(AsTex(mTextures[texId].tex));
         delete AsTex(mTextures[texId].tex);
         mTextures[texId].tex = nullptr;
     }
     mTexturesFreeable.clear();
+    for (void* tex : mTexObjectsFreeable) {
+        ForgetTexObject(tex);
+        C3D_TexDelete(AsTex(tex));
+        delete AsTex(tex);
+    }
+    mTexObjectsFreeable.clear();
+    mVramUploads = 0;
 }
 
-void GfxRenderingAPICitro3D::Replay(FrameRecord& frame) {
-    BeginGpuFrame();
-    if (mTextures.size() < frame.textureCount) {
-        mTextures.resize(frame.textureCount);
+void GfxRenderingAPICitro3D::ForgetTexObject(void* tex) {
+    // A unit left holding a freed texture would hand the GPU freed memory on its next draw
+    for (int unit = 0; unit < 3; unit++) {
+        if (mUnitTex[unit] == tex) {
+            mUnitTex[unit] = unit == 0 ? nullptr : mDummyTex;
+            mUnitStale[unit] = true;
+        }
+        if (mUnitApplied[unit] == tex) {
+            mUnitApplied[unit] = &mUnitApplied; // unknown: rebind on the next draw
+        }
+        if (mEyeStart.unitTex[unit] == tex) {
+            mEyeStart.unitTex[unit] = mUnitTex[unit];
+        }
     }
-    if ((int)mFramebuffers.size() < frame.framebufferCount) {
-        mFramebuffers.resize(frame.framebufferCount);
+}
+
+void GfxRenderingAPICitro3D::Replay(FrameRecord& frame, C3D_RenderTarget_tag* target, int eyeSign, bool secondEye) {
+    if (!secondEye) {
+        if (mTextures.size() < frame.textureCount) {
+            mTextures.resize(frame.textureCount);
+        }
+        if ((int)mFramebuffers.size() < frame.framebufferCount) {
+            mFramebuffers.resize(frame.framebufferCount);
+        }
+        mEyeStart = { mCurrentShader, { mBoundTexture[0], mBoundTexture[1] }, mBoundFramebuffer, mLastSelectedUnit,
+                      { mUnitTex[0], mUnitTex[1], mUnitTex[2] }, mPrimDepth, mDepthTest, mDepthMask, mDecal,
+                      mUseAlpha, mStereoOwnCamera, { mScissor[0], mScissor[1], mScissor[2], mScissor[3] } };
+        mVboUsed = 0;
+        mVboSubmitted = 0;
+    } else {
+        // Start from the state the first eye started from, and draw from its vertices, already
+        // flushed for the GPU
+        const EyeStartState& st = mEyeStart;
+        mCurrentShader = st.shader;
+        mBoundTexture[0] = st.boundTexture[0];
+        mBoundTexture[1] = st.boundTexture[1];
+        mBoundFramebuffer = st.boundFramebuffer;
+        mLastSelectedUnit = st.lastSelectedUnit;
+        for (int unit = 0; unit < 3; unit++) {
+            mUnitTex[unit] = st.unitTex[unit];
+            mUnitStale[unit] = true;
+        }
+        mPrimDepth = st.primDepth;
+        mDepthTest = st.depthTest;
+        mDepthMask = st.depthMask;
+        mDecal = st.decal;
+        mUseAlpha = st.useAlpha;
+        mStereoOwnCamera = st.stereoOwnCamera;
+        SubmitDraws(); // flushes the first eye's last vertices
+        mVboSubmitted = mVboUsed;
+        mVboUsed = 0;
+        // Start the GPU on the first eye now; what is added from here on starts as it arrives.
+        // The queue is never stopped while it runs: citro3d stops it at the next frame's start,
+        // once it has finished (libctru loses count of commands still running when stopped).
+        gxCmdQueueRun(&__C3D_Context);
     }
-    C3D_FrameDrawOn(mTopTarget);
-    mCurrentTarget = mTopTarget;
+    C3D_FrameDrawOn(target);
+    mEyeTarget = target;
+    mCurrentTarget = target;
     mTargetWidth = kScreenWidth;
     mTargetHeight = kScreenHeight;
-    mVboUsed = 0;
-    mVboSubmitted = 0;
-    mDrawsSinceSubmit = 0;
+    mEyeSign = eyeSign;
+    mEyeShift = frame.eyeShift;
+    mSecondEye = secondEye;
+    mLastEyeKind = -1;
     mLastTevProgram = nullptr;
     mLastDepthKey = -1;
     mLastBlendKey = -1;
 
+    if (!secondEye) {
+        // Find the frame's last depth-tested draw on the screen (see ApplyEyeShift)
+        bool depthTest = mDepthTest;
+        bool onScreen = mCurrentTarget == target;
+        mHudFromOp = 0;
+        for (size_t i = 0; i < frame.ops.size(); i++) {
+            const Op& op = frame.ops[i];
+            if (op.type == OpType::DepthTestAndMask) {
+                depthTest = op.args[0] != 0;
+            } else if (op.type == OpType::DrawToFramebuffer) {
+                onScreen = op.args[0] <= 0 || op.args[0] >= (int)mFramebuffers.size() ||
+                           mFramebuffers[op.args[0]].tex == nullptr;
+            } else if (op.type == OpType::Draw && depthTest && onScreen) {
+                mHudFromOp = i + 1;
+            }
+        }
+    }
+
     tReplaying = true;
-    for (const Op& op : frame.ops) {
+    if (!secondEye) {
+        // Texture uploads first: each VRAM upload is then one queued copy ahead of every draw,
+        // rather than a copy plus a send of the draws before it. Every draw sees the frame's final
+        // image of a texture, as with linear memory, where the GPU reads it only once the frame ends.
+        for (const Op& op : frame.ops) {
+            if (op.type == OpType::Upload) {
+                const int* a = op.args;
+                UploadTextureNow((uint32_t)a[0], frame.pixels.data() + a[3], (uint32_t)a[1], (uint32_t)a[2]);
+            }
+        }
+    }
+    if (secondEye) {
+        SetScissor(mEyeStart.scissor[0], mEyeStart.scissor[1], mEyeStart.scissor[2], mEyeStart.scissor[3]);
+    }
+    for (mOpIndex = 0; mOpIndex < frame.ops.size(); mOpIndex++) {
+        const Op& op = frame.ops[mOpIndex];
         const int* a = op.args;
         switch (op.type) {
             case OpType::LoadShader:
@@ -1518,16 +1686,120 @@ void GfxRenderingAPICitro3D::Replay(FrameRecord& frame) {
                 ClearFramebuffer(a[0] != 0, a[1] != 0);
                 break;
             case OpType::Upload:
-                UploadTextureNow((uint32_t)a[0], frame.pixels.data() + a[3], (uint32_t)a[1], (uint32_t)a[2]);
+                break; // done before the draws
+            case OpType::StereoOwnCamera:
+                mStereoOwnCamera = a[0] != 0;
                 break;
             case OpType::FramebufferSize:
-                SetFramebufferSize(a[0], (uint32_t)a[1], (uint32_t)a[2]);
+                if (!secondEye) {
+                    SetFramebufferSize(a[0], (uint32_t)a[1], (uint32_t)a[2]);
+                }
                 break;
         }
     }
     tReplaying = false;
-    // Textures deleted this frame are freed once the GPU has drawn it
-    mTexturesFreeable.insert(mTexturesFreeable.end(), frame.deleted.begin(), frame.deleted.end());
+    mSecondEye = false;
+}
+
+void GfxRenderingAPICitro3D::ApplyEyeShift(const float* firstVertex, bool sampledFramebuffer) {
+    // Only the screen gets shifted: not offscreen framebuffers, nor a copy of the screen drawn
+    // back (the pause menu's background), which is already this eye's image. The HUD is
+    // rectangles and orthographic draws, which have w = 1, and what is drawn without depth testing
+    // after the world: the game draws its counters and the pause menu in perspective.
+    const bool screen = mCurrentTarget == mEyeTarget && !sampledFramebuffer;
+    const bool hud = firstVertex[3] == 1.0f || (!mDepthTest && mOpIndex >= mHudFromOp);
+    // Under the game's own camera, rectangles (w = 1) stay with the HUD
+    const bool ownCamera = mStereoOwnCamera && firstVertex[3] != 1.0f;
+    const int kind = (mEyeSign == 0 || !screen) ? 0 : ownCamera ? 3 : hud ? 1 : 2;
+    if (ownCamera && screen && !mSecondEye) {
+        mOwnCameraWMin = std::min(mOwnCameraWMin, firstVertex[3]);
+        mOwnCameraWMax = std::max(mOwnCameraWMax, firstVertex[3]);
+    }
+    if (screen && !hud && !mSecondEye) {
+        const float w = firstVertex[3];
+        int band = 0;
+        for (float limit = 100.0f; band < 7 && w >= limit; limit *= 2.0f) {
+            band++;
+        }
+        mWorldDepths[band]++;
+    }
+    if (kind == mLastEyeKind) {
+        return;
+    }
+    mLastEyeKind = kind;
+    // The screen's x is the sideways framebuffer's -y; a distant point moves left for the left eye
+    const float shift = -(float)mEyeSign * mEyeShift;
+    if (kind == 2 || kind == 3) {
+        const float convergence = kind == 3 ? kOwnCameraConvergence : mConvergence;
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, shift, -convergence, -kPopOutCap, 0.0f);
+    } else if (kind == 1) {
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, 0.0f, 0.0f, 0.0f, shift * mHudDepth);
+    } else {
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+void GfxRenderingAPICitro3D::UpdateStereoTuning() {
+    // A hidden tuning control for 3D: hold SELECT and tap the bottom screen's top half to move the
+    // convergence distance (left nearer, right farther), or its bottom half to move the HUD (left
+    // out, right in)
+    const bool held = (hidKeysHeld() & (KEY_TOUCH | KEY_SELECT)) == (KEY_TOUCH | KEY_SELECT);
+    const bool tapped = held && !mTouchHeld;
+    mTouchHeld = held;
+    if (!tapped) {
+        return;
+    }
+    touchPosition touch;
+    hidTouchRead(&touch);
+    const bool right = touch.px >= 160;
+    if (touch.py < 120) {
+        mConvergence = std::clamp(mConvergence * (right ? 1.25f : 0.8f), 25.0f, 20000.0f);
+    } else {
+        mHudDepth = std::clamp(mHudDepth + (right ? 0.25f : -0.25f), -2.0f, 2.0f);
+    }
+    char note[48];
+    snprintf(note, sizeof(note), "3D: convergence %.0f, HUD %+.2f", mConvergence, mHudDepth);
+    printf("%s\n", note);
+    Update3dsStatusNote(note);
+}
+
+void GfxRenderingAPICitro3D::PromoteTextures() {
+    // Move textures that went to linear memory, in a frame with too many uploads, to VRAM with
+    // what is left of this frame's copies. The copies run after this frame's draws; the linear
+    // copy is freed once the GPU is done with it.
+    constexpr uint32_t kChecksPerFrame = 64;
+    for (uint32_t checked = 0; checked < kChecksPerFrame && mVramUploads < kMaxVramUploadsPerFrame &&
+                               !mTextures.empty();
+         checked++) {
+        mPromoteCursor = mPromoteCursor + 1 < mTextures.size() ? mPromoteCursor + 1 : 0;
+        Texture& t = mTextures[mPromoteCursor];
+        if (t.tex == nullptr || t.inVram) {
+            continue;
+        }
+        C3D_Tex* linear = AsTex(t.tex);
+        const size_t bytes = TextureBytes(linear->width, linear->height, linear->fmt);
+        if (vramSpaceFree() < bytes + kVramReserve) {
+            continue; // a smaller one may still fit
+        }
+        C3D_Tex* vram = new C3D_Tex();
+        if (!C3D_TexInitVRAM(vram, linear->width, linear->height, linear->fmt)) {
+            delete vram;
+            continue;
+        }
+        vram->param = linear->param; // filter and wrap
+        GX_TextureCopy((u32*)linear->data, 0, (u32*)vram->data, 0, (u32)bytes, GX_TRANSFER_RAW_COPY(1));
+        mTexObjectsFreeable.push_back(linear);
+        t.tex = vram;
+        t.inVram = true;
+        mVramTextures++;
+        mVramUploads++;
+        // A unit still holding the linear copy rebinds
+        for (int unit = 0; unit < 3; unit++) {
+            if (mUnitTex[unit] == linear) {
+                BindUnit(unit, vram);
+            }
+        }
+    }
 }
 
 void GfxRenderingAPICitro3D::ReplayLoop() {
@@ -1616,10 +1888,31 @@ void GfxRenderingAPICitro3D::EndFrame() {
 
 void GfxRenderingAPICitro3D::FinishFrame(FrameRecord& frame) {
     const uint64_t replayStart = svcGetSystemTick();
-    Replay(frame);
+    // Stereoscopic 3D when the slider is up: the frame is replayed once per eye. Otherwise the
+    // screen shows one image, at the cost of one.
+    const bool stereo = frame.eyeShift > 0.0f && mRightTarget != nullptr;
+    gfxSet3D(stereo);
+    BeginGpuFrame();
+    Replay(frame, mTopTarget, stereo ? -1 : 0, false);
+    if (stereo) {
+        Replay(frame, mRightTarget, 1, true);
+    }
+    // Textures deleted this frame are freed once the GPU has drawn it
+    mTexturesFreeable.insert(mTexturesFreeable.end(), frame.deleted.begin(), frame.deleted.end());
     SubmitDraws();
-    C3D_FrameEnd(0);
+    PromoteTextures();
+    // C3D_FrameEnd(0) would flush all of linear memory, tens of MB, from the CPU's cache, through
+    // the GPU service on core 1. Flush only what the CPU wrote for the GPU or the screens: the
+    // command list (here and in SubmitDraws), the vertex buffer (SubmitDraws), textures (on
+    // upload), and the bottom screen's text console.
+    u16 bottomWidth = 0;
+    u16 bottomHeight = 0;
+    u8* bottom = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &bottomWidth, &bottomHeight);
+    svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)bottom,
+                             (u32)bottomWidth * bottomHeight * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_BOTTOM)));
+    C3D_FrameEnd(GX_CMDLIST_FLUSH);
     UpdateGpuTest();
+    UpdateStereoTuning();
 
     mFrameCount++;
     const uint64_t now = svcGetSystemTick();
@@ -1694,8 +1987,22 @@ void GfxRenderingAPICitro3D::FinishFrame(FrameRecord& frame) {
         if (mReplayThread != nullptr) {
             PrintPhaseProfile("replay", sReplaySamples, sReplayAtLastPrint);
         }
-        printf("  textures so far: %lu 8-bit, %lu 16-bit, %lu 32-bit\n", (unsigned long)mTexturesByBits[0],
-               (unsigned long)mTexturesByBits[1], (unsigned long)mTexturesByBits[2]);
+        printf("  textures so far: %lu 8-bit, %lu 16-bit, %lu 32-bit; %lu in VRAM, %lu KB VRAM free\n",
+               (unsigned long)mTexturesByBits[0], (unsigned long)mTexturesByBits[1],
+               (unsigned long)mTexturesByBits[2], (unsigned long)mVramTextures,
+               (unsigned long)(vramSpaceFree() / 1024));
+        const uint32_t* d = mWorldDepths;
+        printf("  3D: shift %.3f, convergence %.0f, HUD %+.2f; world draws by w: <100 %lu, <200 %lu, <400 %lu, "
+               "<800 %lu, <1600 %lu, <3200 %lu, <6400 %lu, more %lu\n",
+               frame.eyeShift, mConvergence, mHudDepth, (unsigned long)d[0], (unsigned long)d[1],
+               (unsigned long)d[2], (unsigned long)d[3], (unsigned long)d[4], (unsigned long)d[5],
+               (unsigned long)d[6], (unsigned long)d[7]);
+        memset(mWorldDepths, 0, sizeof(mWorldDepths));
+        if (mOwnCameraWMax > 0.0f) {
+            printf("  3D: own-camera draws at w %.0f to %.0f\n", mOwnCameraWMin, mOwnCameraWMax);
+        }
+        mOwnCameraWMin = 1e9f;
+        mOwnCameraWMax = 0.0f;
         mWaitTicksTotal = 0;
         mReplayTicksTotal = 0;
         mHandoffTicksTotal = 0;
@@ -1755,8 +2062,8 @@ void GfxRenderingAPICitro3D::StartDrawToFramebuffer(int fbId, float noiseScale) 
         return;
     }
     if (fbId <= 0 || fbId >= (int)mFramebuffers.size() || mFramebuffers[fbId].tex == nullptr) {
-        C3D_FrameDrawOn(mTopTarget);
-        mCurrentTarget = mTopTarget;
+        C3D_FrameDrawOn(mEyeTarget);
+        mCurrentTarget = mEyeTarget;
         mTargetWidth = kScreenWidth;
         mTargetHeight = kScreenHeight;
         return;
@@ -1791,14 +2098,34 @@ void GfxRenderingAPICitro3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0
         return;
     }
     Framebuffer& fb = mFramebuffers[fbDstId];
+    // The game copies the screen once and draws the copy for as long as it needs it (the pause
+    // menu's background): in 3D each eye keeps its own
+    void* dstTex = fb.tex;
+    if (mEyeSign > 0) {
+        if (fb.rightTex == nullptr) {
+            C3D_Tex* tex = new C3D_Tex();
+            if (!C3D_TexInit(tex, kFbTexWidth, kFbTexHeight, GPU_RGBA8)) {
+                printf("citro3d: out of memory for framebuffer %d's right eye\n", fbDstId);
+                delete tex;
+                return;
+            }
+            C3D_TexSetFilter(tex, GPU_LINEAR, GPU_LINEAR);
+            C3D_TexSetWrap(tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+            fb.rightTex = tex;
+        }
+        dstTex = fb.rightTex;
+        fb.rightValid = true;
+    } else if (mEyeSign == 0) {
+        fb.rightValid = false;
+    }
     // The copy engine runs from the GX queue, after anything already submitted: submit the
     // frame's draws so far first
     SubmitDraws();
     // Both are 8x8-tiled RGBA8, so copy tile row by tile row: 240 pixels of each 256-wide row
-    C3D_FrameBuf& screen = mTopTarget->frameBuf;
+    C3D_FrameBuf& screen = mEyeTarget->frameBuf;
     const u32 rowBytes = (u32)screen.width * 8 * 4;
     const u32 texRowBytes = (u32)kFbTexWidth * 8 * 4;
-    u8* dst = (u8*)AsTex(fb.tex)->data + kCopyTileRowOffset * texRowBytes;
+    u8* dst = (u8*)AsTex(dstTex)->data + kCopyTileRowOffset * texRowBytes;
     GX_TextureCopy((u32*)screen.colorBuf, GX_BUFFER_DIM(rowBytes >> 4, 0), (u32*)dst,
                    GX_BUFFER_DIM(rowBytes >> 4, (texRowBytes - rowBytes) >> 4), rowBytes * (screen.height / 8),
                    GX_TRANSFER_RAW_COPY(1));
@@ -1843,6 +2170,10 @@ void* GfxRenderingAPICitro3D::GetFramebufferTextureId(int fbId) {
     return nullptr;
 }
 
+void* GfxRenderingAPICitro3D::EyeTexture(const Framebuffer& fb) const {
+    return (mEyeSign > 0 && fb.rightValid) ? fb.rightTex : fb.tex;
+}
+
 void GfxRenderingAPICitro3D::SelectTextureFb(int fbId) {
     if (!tReplaying) {
         Record(OpType::SelectTextureFb).args[0] = fbId;
@@ -1851,7 +2182,7 @@ void GfxRenderingAPICitro3D::SelectTextureFb(int fbId) {
     if (fbId <= 0 || fbId >= (int)mFramebuffers.size() || mFramebuffers[fbId].tex == nullptr) {
         return;
     }
-    BindUnit(0, AsTex(mFramebuffers[fbId].tex));
+    BindUnit(0, AsTex(EyeTexture(mFramebuffers[fbId])));
     mBoundFramebuffer = fbId;
 }
 
@@ -1876,6 +2207,14 @@ void GfxRenderingAPICitro3D::SetSrgbMode() {
 
 ImTextureID GfxRenderingAPICitro3D::GetTextureById(int id) {
     return (ImTextureID)0;
+}
+
+void GfxRenderingAPICitro3D::SetStereoOwnCamera(bool ownCamera) {
+    // Called before every batch: record only changes
+    if (!tReplaying && ownCamera != mRecStereoOwnCamera) {
+        mRecStereoOwnCamera = ownCamera;
+        Record(OpType::StereoOwnCamera).args[0] = ownCamera;
+    }
 }
 
 void GfxRenderingAPICitro3D::SetCurrentPrimDepth(float depth) {

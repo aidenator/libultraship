@@ -1,6 +1,14 @@
 ; Fast3D vertex shader for the 3DS: the interpreter transforms and lights vertices on the CPU,
 ; so this only passes them through. The renderer has already rotated positions for the
 ; sideways-mounted top screen.
+;
+; For stereoscopic 3D each eye shifts the position across the screen (the sideways y axis):
+; shift = stereo.x * max(w - convergence, -popOutCap * w) + stereo.w, with
+; stereo = (eye shift, -convergence, -popOutCap, fixed shift). Things at the convergence
+; distance stay at the screen's depth; the cap keeps close-ups from popping too far out. The HUD
+; uses only the fixed shift; everything is zero for one eye.
+
+.fvec stereo
 
 .out outpos position
 .out outtc0 texcoord0
@@ -15,7 +23,14 @@
 .alias inclr v4
 
 .proc main
-	mov outpos, inpos
+	mov r0, inpos
+	add r1.x, stereo.y, inpos.w
+	mul r1.y, stereo.z, inpos.w
+	max r1.x, r1.x, r1.y
+	mul r1.x, stereo.x, r1.x
+	add r1.x, stereo.w, r1.x
+	add r0.y, r0.y, r1.x
+	mov outpos, r0
 	mov outtc0, intc0
 	mov outtc1, intc1
 	mov outtc2, intc2

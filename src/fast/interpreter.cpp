@@ -147,6 +147,7 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
 volatile uint32_t gRenderPhase = RENDER_PHASE_OUTSIDE_LIST;
+float gClipScaleX = 1.0f;
 
 namespace {
 struct MicrosecondTimer {
@@ -163,6 +164,7 @@ struct MicrosecondTimer {
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+        mRapi->SetStereoOwnCamera((mRsp->extra_geometry_mode & G_EX_STEREO_OWN_CAMERA) != 0);
         RenderPhaseScope phase{ RENDER_PHASE_BACKEND };
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
@@ -1774,10 +1776,11 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         // trivial clip rejection
         d->clip_rej = 0;
-        if (x < -w) {
+        const float xLimit = w * gClipScaleX;
+        if (x < -xLimit) {
             d->clip_rej |= 1; // CLIP_LEFT
         }
-        if (x > w) {
+        if (x > xLimit) {
             d->clip_rej |= 2; // CLIP_RIGHT
         }
         if (y < -w) {
@@ -2372,6 +2375,9 @@ void Interpreter::GfxSpGeometryMode(uint32_t clear, uint32_t set) {
 }
 
 void Interpreter::GfxSpExtraGeometryMode(uint32_t clear, uint32_t set) {
+    if (((mRsp->extra_geometry_mode & ~clear) | set) != mRsp->extra_geometry_mode) {
+        Flush(); // the batch so far keeps the old mode
+    }
     mRsp->extra_geometry_mode &= ~clear;
     mRsp->extra_geometry_mode |= set;
 }

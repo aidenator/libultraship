@@ -122,12 +122,14 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
     void SetCurrentPrimDepth(float depth) override;
+    void SetStereoOwnCamera(bool ownCamera) override;
 
   private:
     struct Texture {
         void* tex = nullptr; // C3D_Tex, an anonymous struct that cannot be forward-declared
         float scaleS = 1.0f; // the image's share of the power-of-two texture it was padded into
         float scaleT = 1.0f;
+        bool inVram = false; // in VRAM, which the GPU reads faster: uploads go through a copy
     };
 
     // An offscreen framebuffer: a 256x512 texture holding an image stored sideways like the screen
@@ -138,7 +140,12 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
         uint32_t height = 0;
         uint32_t contentWidth = 0; // the size of the image it holds: a copied screen, or its own drawing
         uint32_t contentHeight = 0;
+        // In stereoscopic 3D, the right eye's copy of the screen (C3D_Tex), and whether it is from
+        // the same frame as the left eye's
+        void* rightTex = nullptr;
+        bool rightValid = false;
     };
+    void* EyeTexture(const Framebuffer& fb) const;
 
     const Citro3D::TevProgram& GetTevProgram(ShaderProgram* prg, int primaryRgb, int primaryAlpha);
     void ApplyTevProgram(const Citro3D::TevProgram& program, const float* inputs, bool hasFog, const float* fog);
@@ -168,6 +175,7 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
         Clear,
         Upload,
         FramebufferSize,
+        StereoOwnCamera,
     };
     struct Op {
         OpType type;
@@ -198,10 +206,31 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
         uint64_t vblankWaitTicks = 0; // of that, waiting for vblank
         uint32_t textureCount = 0;    // ids handed out by the frame's end
         int framebufferCount = 1;
+        // Stereoscopic 3D: how far each eye's view of a distant point moves sideways, as a share
+        // of half the screen's width, from the 3D slider when recorded. 0 draws one image.
+        float eyeShift = 0.0f;
+    };
+    // The replay state that the game's commands change, saved before the first eye so the second
+    // starts from the same state
+    struct EyeStartState {
+        ShaderProgram* shader;
+        uint32_t boundTexture[2];
+        int boundFramebuffer;
+        int lastSelectedUnit;
+        void* unitTex[3];
+        float primDepth;
+        bool depthTest, depthMask, decal, useAlpha, stereoOwnCamera;
+        int scissor[4];
     };
     Op& Record(OpType type);
     void BeginGpuFrame();
-    void Replay(FrameRecord& frame);
+    // Replays the frame into one eye's target: eyeSign -1 for the left eye, 1 for the right, 0 for
+    // a single image. The second eye reuses the first eye's vertices.
+    void Replay(FrameRecord& frame, C3D_RenderTarget_tag* target, int eyeSign, bool secondEye);
+    void ApplyEyeShift(const float* firstVertex, bool sampledFramebuffer);
+    void UpdateStereoTuning();
+    void PromoteTextures();
+    void ForgetTexObject(void* tex);
     void FinishFrame(FrameRecord& frame);
     void ReplayLoop();
     void UploadTextureNow(uint32_t texId, const uint8_t* rgba32Buf, uint32_t width, uint32_t height);
@@ -210,7 +239,9 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void BindUnit(int unit, void* tex);
     void ApplyTextureUnits(const Citro3D::TevProgram& program);
 
-    C3D_RenderTarget_tag* mTopTarget = nullptr;
+    C3D_RenderTarget_tag* mTopTarget = nullptr;   // the left eye, or the only one
+    C3D_RenderTarget_tag* mRightTarget = nullptr; // the right eye, for stereoscopic 3D
+    C3D_RenderTarget_tag* mEyeTarget = nullptr;   // the screen target being replayed into
     C3D_RenderTarget_tag* mCurrentTarget = nullptr;
     uint32_t mTargetWidth = 400; // logical size of what is being drawn to
     uint32_t mTargetHeight = 240;
@@ -240,6 +271,10 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     uint32_t mRecTextureCount = 0;  // ids handed out; the replay grows mTextures to match
     int mRecFramebufferCount = 1;
     std::vector<uint32_t> mTexturesFreeable; // deleted before the frame the GPU is drawing
+    std::vector<void*> mTexObjectsFreeable;  // C3D_Tex replaced or used for a copy this frame
+    uint32_t mVramTextures = 0;
+    uint32_t mVramUploads = 0; // this frame
+    size_t mPromoteCursor = 0;
 
     // The replay thread, if there is one
     void* mReplayThread = nullptr;
@@ -261,6 +296,27 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     int mLastDepthKey = -1;
     int mLastBlendKey = -1;
     float mPrimDepth = 0.0f;
+
+    // Stereoscopic 3D. The vertex shader shifts each vertex sideways by its depth (see
+    // fast3d.v.pica); world draws use the convergence distance, the HUD a fixed depth.
+    int mStereoUniform = -1;
+    int mEyeSign = 0;
+    float mEyeShift = 0.0f;
+    bool mSecondEye = false; // reusing the first eye's vertices
+    bool mStereoOwnCamera = false;    // G_EX_STEREO_OWN_CAMERA, as replayed
+    bool mRecStereoOwnCamera = false; // as recorded
+    float mOwnCameraWMin = 1e9f;      // the depths of own-camera draws since the last stats line
+    float mOwnCameraWMax = 0.0f;
+    int mLastEyeKind = -1;   // the shift the shader has: 0 none, 1 HUD, 2 world, 3 own camera
+    // Just past the frame's last depth-tested draw on the screen: draws from there without depth
+    // testing are the HUD, pause menu included, which the game draws in perspective
+    size_t mHudFromOp = 0;
+    size_t mOpIndex = 0;
+    float mConvergence = 384.0f; // the distance, in w, that stays at the screen's depth
+    float mHudDepth = -0.5f;      // the HUD's depth, as a share of the farthest shift (+ is into the screen)
+    bool mTouchHeld = false;
+    EyeStartState mEyeStart = {};
+    uint32_t mWorldDepths[8] = {}; // world draws by the first vertex's w, in doubling bands from 100
     FilteringMode mFilterMode = FILTER_LINEAR;
 
     // A test that turns one GPU cost off, to find what the GPU spends its time on: cycled with
