@@ -48,6 +48,22 @@ extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* at
     return __real_pthread_create(thread, &sized, start, arg);
 }
 
+// SDL starts its audio thread on core 1. When the system will not take another thread there, SDL
+// gives up on audio and the game cannot start, so run that thread (or any other core 1 thread not
+// started by Start3dsThreadOnCore, which handles its own failures) on the app's own core instead.
+extern "C" Thread __real_threadCreate(ThreadFunc entry, void* arg, size_t stackSize, int prio, int core,
+                                      bool detached);
+
+extern "C" Thread __wrap_threadCreate(ThreadFunc entry, void* arg, size_t stackSize, int prio, int core,
+                                      bool detached) {
+    Thread thread = __real_threadCreate(entry, arg, stackSize, prio, core, detached);
+    if (thread == nullptr && core == 1) {
+        printf("No room on core 1, starting a thread on core 0\n");
+        thread = __real_threadCreate(entry, arg, stackSize, prio, -2, detached);
+    }
+    return thread;
+}
+
 // SDL's main() mounts the app's romfs before calling SDL_main. The app has no romfs (everything is
 // read from sdmc:/3ds/lighthouse), but looking for one still takes about a second, so skip it.
 extern "C" Result __wrap_romfsMountSelf(const char* name) {
@@ -73,7 +89,7 @@ void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core) {
     }
     s32 priority = 0x30;
     svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
-    return threadCreate(entry, arg, kMinThreadStackSize, priority, core, false);
+    return __real_threadCreate(entry, arg, kMinThreadStackSize, priority, core, false);
 }
 
 bool Is3dsNew() {

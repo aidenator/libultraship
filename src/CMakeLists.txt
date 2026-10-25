@@ -230,6 +230,8 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Nintendo3DS")
     target_link_options(libultraship INTERFACE -Wl,--wrap=pthread_create)
     # Skip SDL's romfs mount before SDL_main (see __wrap_romfsMountSelf in gfx_3ds.cpp)
     target_link_options(libultraship INTERFACE -Wl,--wrap=romfsMountSelf)
+    # Fall back to core 0 when SDL's audio thread cannot start on core 1 (see __wrap_threadCreate)
+    target_link_options(libultraship INTERFACE -Wl,--wrap=threadCreate)
 else()
     target_compile_definitions(libultraship PRIVATE
         ENABLE_OPENGL
