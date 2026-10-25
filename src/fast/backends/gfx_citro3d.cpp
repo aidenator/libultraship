@@ -4,6 +4,7 @@
 #include "fast/backends/gfx_3ds.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,13 @@
 extern "C" gxCmdQueue_s __C3D_Context;
 
 namespace Fast {
+
+// Set by the game for a scene with its own convergence (see Set3dsSceneConvergence); 0 when none
+static std::atomic<float> sSceneConvergence{ 0.0f };
+
+void Set3dsSceneConvergence(float convergence) {
+    sSceneConvergence.store(convergence, std::memory_order_relaxed);
+}
 
 using namespace Citro3D;
 
@@ -1730,7 +1738,8 @@ void GfxRenderingAPICitro3D::ApplyEyeShift(const float* firstVertex, bool sample
     // The screen's x is the sideways framebuffer's -y; a distant point moves left for the left eye
     const float shift = -(float)mEyeSign * mEyeShift;
     if (kind == 2 || kind == 3) {
-        const float convergence = kind == 3 ? kOwnCameraConvergence : mConvergence;
+        const float scene = sSceneConvergence.load(std::memory_order_relaxed);
+        const float convergence = kind == 3 ? kOwnCameraConvergence : (scene > 0.0f ? scene : mConvergence);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, shift, -convergence, -kPopOutCap, 0.0f);
     } else if (kind == 1) {
         C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, 0.0f, 0.0f, 0.0f, shift * mHudDepth);
@@ -1752,13 +1761,21 @@ void GfxRenderingAPICitro3D::UpdateStereoTuning() {
     touchPosition touch;
     hidTouchRead(&touch);
     const bool right = touch.px >= 160;
+    // A scene with its own convergence tunes that one
+    const float scene = sSceneConvergence.load(std::memory_order_relaxed);
+    float convergence = scene > 0.0f ? scene : mConvergence;
     if (touch.py < 120) {
-        mConvergence = std::clamp(mConvergence * (right ? 1.25f : 0.8f), 25.0f, 20000.0f);
+        convergence = std::clamp(convergence * (right ? 1.25f : 0.8f), 25.0f, 20000.0f);
+        if (scene > 0.0f) {
+            sSceneConvergence.store(convergence, std::memory_order_relaxed);
+        } else {
+            mConvergence = convergence;
+        }
     } else {
         mHudDepth = std::clamp(mHudDepth + (right ? 0.25f : -0.25f), -2.0f, 2.0f);
     }
     char note[48];
-    snprintf(note, sizeof(note), "3D: convergence %.0f, HUD %+.2f", mConvergence, mHudDepth);
+    snprintf(note, sizeof(note), "3D: convergence %.0f, HUD %+.2f", convergence, mHudDepth);
     printf("%s\n", note);
     Update3dsStatusNote(note);
 }
@@ -1992,9 +2009,10 @@ void GfxRenderingAPICitro3D::FinishFrame(FrameRecord& frame) {
                (unsigned long)mTexturesByBits[2], (unsigned long)mVramTextures,
                (unsigned long)(vramSpaceFree() / 1024));
         const uint32_t* d = mWorldDepths;
+        const float scene = sSceneConvergence.load(std::memory_order_relaxed);
         printf("  3D: shift %.3f, convergence %.0f, HUD %+.2f; world draws by w: <100 %lu, <200 %lu, <400 %lu, "
                "<800 %lu, <1600 %lu, <3200 %lu, <6400 %lu, more %lu\n",
-               frame.eyeShift, mConvergence, mHudDepth, (unsigned long)d[0], (unsigned long)d[1],
+               frame.eyeShift, scene > 0.0f ? scene : mConvergence, mHudDepth, (unsigned long)d[0], (unsigned long)d[1],
                (unsigned long)d[2], (unsigned long)d[3], (unsigned long)d[4], (unsigned long)d[5],
                (unsigned long)d[6], (unsigned long)d[7]);
         memset(mWorldDepths, 0, sizeof(mWorldDepths));

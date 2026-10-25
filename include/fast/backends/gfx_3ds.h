@@ -32,6 +32,10 @@ void Show3dsLoadingScreen(const char* title, const char* version);
 /// Moves the loading bar to fraction (0 to 1) and names the step under way; also logs the time
 void Set3dsLoadProgress(float fraction, const char* step);
 
+/// Uses convergence (the distance drawn at the screen's depth in 3D) for the world instead of the
+/// usual one, for a scene that looks better with its own, such as the file select; 0 goes back
+void Set3dsSceneConvergence(float convergence);
+
 /**
  * @brief Turns the bottom screen into a status screen, once loading is done.
  *
