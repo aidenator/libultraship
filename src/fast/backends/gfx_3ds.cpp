@@ -76,20 +76,32 @@ void* Start3dsThreadOnCore(void (*entry)(void*), void* arg, int core) {
     if (core >= 2 && !Is3dsNew()) {
         return nullptr;
     }
-    // Core 1 is the system's, and an app may only use the share of it the system grants. 80% is
-    // the most the system accepts.
-    static bool sCore1Granted = false;
-    if (core == 1 && !sCore1Granted) {
-        const Result res = APT_SetAppCpuTimeLimit(80);
-        if (R_FAILED(res)) {
+    // Core 1 is the system's, and an app may only use the share of it the system grants: 80% at
+    // most from the Homebrew Launcher. Installed as a .cia the system grants less, so ask for less
+    // rather than go without core 1.
+    static int sCore1Percent = 0;
+    if (core == 1 && sCore1Percent == 0) {
+        Result res = 0;
+        for (int percent : { 80, 70, 50, 30 }) {
+            res = APT_SetAppCpuTimeLimit(percent);
+            if (R_SUCCEEDED(res)) {
+                sCore1Percent = percent;
+                break;
+            }
+        }
+        if (sCore1Percent == 0) {
             printf("No time on core 1 (0x%08lx)\n", (unsigned long)res);
             return nullptr;
         }
-        sCore1Granted = true;
+        printf("%d%% of core 1\n", sCore1Percent);
     }
     s32 priority = 0x30;
     svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
-    return __real_threadCreate(entry, arg, kMinThreadStackSize, priority, core, false);
+    Thread thread = __real_threadCreate(entry, arg, kMinThreadStackSize, priority, core, false);
+    if (thread == nullptr) {
+        printf("Could not start a thread on core %d\n", core);
+    }
+    return thread;
 }
 
 bool Is3dsNew() {

@@ -185,8 +185,15 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         GetLogger()->flush_on(spdlog::level::trace);
 #else
         mLogThreadPool = std::make_shared<spdlog::details::thread_pool>(LUS_LOG_QUEUE_SIZE, 1);
+#ifdef __3DS__
+        // The log's writer thread gets little CPU beside the renderer, and its queue is short; a full
+        // queue must not stop the game, so the oldest message gives way
+        constexpr auto overflowPolicy = spdlog::async_overflow_policy::overrun_oldest;
+#else
+        constexpr auto overflowPolicy = spdlog::async_overflow_policy::block;
+#endif
         mLogger = std::make_shared<spdlog::async_logger>(GetName(), sinks.begin(), sinks.end(), mLogThreadPool,
-                                                         spdlog::async_overflow_policy::block);
+                                                         overflowPolicy);
         GetLogger()->set_level(releaseBuildLogLevel);
         GetLogger()->flush_on(spdlog::level::info);
 #endif
