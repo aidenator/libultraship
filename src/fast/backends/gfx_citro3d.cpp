@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1819,12 +1820,28 @@ void GfxRenderingAPICitro3D::PromoteTextures() {
     }
 }
 
+// A wait for the other side of the main/replay handoff. After hours of play the two once waited
+// on each other with the frame handed over: a wake-up went missing (libctru's condition variable,
+// as far as could be told). So wait in short slices and check again; a missed wake-up then costs
+// one slice instead of the game.
+template <typename Ready> void GfxRenderingAPICitro3D::WaitForReplay(std::unique_lock<std::mutex>& lock, Ready ready) {
+    while (!ready()) {
+        if (mReplayCv.wait_for(lock, std::chrono::milliseconds(50)) == std::cv_status::timeout && ready()) {
+            static int sMissed = 0;
+            if (++sMissed <= 20) {
+                printf("Renderer handoff: a wake-up was missed (%d so far)\n", sMissed);
+                SPDLOG_WARN("Renderer handoff: a wake-up was missed ({} so far)", sMissed);
+            }
+        }
+    }
+}
+
 void GfxRenderingAPICitro3D::ReplayLoop() {
     for (;;) {
         FrameRecord* frame;
         {
             std::unique_lock<std::mutex> lock(mReplayMutex);
-            mReplayCv.wait(lock, [this] { return mReplayFrame != nullptr || mReplayQuit; });
+            WaitForReplay(lock, [this] { return mReplayFrame != nullptr || mReplayQuit; });
             if (mReplayFrame == nullptr) {
                 return;
             }
@@ -1886,7 +1903,7 @@ void GfxRenderingAPICitro3D::EndFrame() {
         const uint64_t waitStart = svcGetSystemTick();
         {
             std::unique_lock<std::mutex> lock(mReplayMutex);
-            mReplayCv.wait(lock, [this] { return mReplayFrame == nullptr; });
+            WaitForReplay(lock, [this] { return mReplayFrame == nullptr; });
             rec.handoffWaitTicks = svcGetSystemTick() - waitStart;
             mReplayFrame = &rec;
             mRec = &rec == &mFrames[0] ? &mFrames[1] : &mFrames[0];

@@ -233,6 +233,7 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     void ForgetTexObject(void* tex);
     void FinishFrame(FrameRecord& frame);
     void ReplayLoop();
+    template <typename Ready> void WaitForReplay(std::unique_lock<std::mutex>& lock, Ready ready);
     void UploadTextureNow(uint32_t texId, const uint8_t* rgba32Buf, uint32_t width, uint32_t height);
     void SetFramebufferSize(int fbId, uint32_t width, uint32_t height);
     void UpdateGpuTest();
