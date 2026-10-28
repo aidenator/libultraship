@@ -43,6 +43,27 @@ void Set3dsLoadProgress(float fraction, const char* step);
 /// usual one, for a scene that looks better with its own, such as the file select; 0 goes back
 void Set3dsSceneConvergence(float convergence);
 
+/// The player's 3D settings: convergence (the distance drawn at the screen's depth) and the HUD's
+/// depth, as a share of the farthest shift (+ is into the screen)
+void Set3dsStereoDepth(float convergence, float hudDepth);
+
+/**
+ * @brief Switches the bottom screen between the status screen and a page the game draws, such as
+ * a menu.
+ *
+ * Switching clears the screen. The status lines, frame rate and note keep updating while the
+ * game's page is up, and come back as they are; the game then draws its own parts of the status
+ * screen again, such as a button.
+ */
+void Set3dsBottomPage(bool gamePage);
+
+/// Writes text at a cell of the 40x30 bottom screen (column, row, from 0), over what is there.
+/// ANSI codes set the colours, and are reset after the text.
+void Draw3dsBottomText(int column, int row, const char* text);
+
+/// A tap on the bottom screen since the last call, as the cell tapped; false when none
+bool Take3dsTap(int* column, int* row);
+
 /**
  * @brief Turns the bottom screen into a status screen, once loading is done.
  *

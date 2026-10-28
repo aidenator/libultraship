@@ -153,6 +153,14 @@ static LightLock sConsoleLock;
 static bool sLoadingScreenUp = false;
 static bool sStatusScreenUp = false;
 static int sShownFps = -1;
+// The status screen's parts, kept while the game's page is up (see Set3dsBottomPage). sPageLock
+// covers them and the page: the renderer and game update them while the main thread switches.
+static LightLock sPageLock;
+static bool sGamePageUp = false;
+static char sStatusTitle[48];
+static char sStatusVersion[48];
+static char sStatusShown[14][48]; // kStatusLineCount
+static char sStatusNote[48];
 static int sShownBarCells = -1;
 static uint64_t sStartTick = 0;
 // When the screens were up and when stdout reached the 3dslink host, for the startup log
@@ -333,6 +341,27 @@ void Set3dsLoadProgress(float fraction, const char* step) {
     ConsoleWrite(bar);
 }
 
+// The status screen as it stands; sPageLock held
+static void DrawStatusScreen() {
+    ShowTitle(sStatusTitle, sStatusVersion);
+    for (int index = 0; index < kStatusLineCount; index++) {
+        const char* text = sStatusShown[index];
+        // A line starting with '*' is a heading
+        if (text[0] == '*') {
+            ConsoleRow(kFirstStatusLine + index, "\x1b[36;1m", text + 1);
+        } else {
+            ConsoleRow(kFirstStatusLine + index, "", text);
+        }
+    }
+    if (sShownFps >= 0) {
+        char text[16];
+        snprintf(text, sizeof(text), "%d fps", sShownFps);
+        ConsoleRow(kFpsRow, "\x1b[32m", text);
+    }
+    ConsoleRow(kNoteRow, "\x1b[33m", sStatusNote);
+    ConsoleRow(kHintRow, "\x1b[2m", "START + SELECT to quit");
+}
+
 void Show3dsStatusScreen(const char* title, const char* version) {
     if (sConsoleDevice == nullptr || sStatusScreenUp) {
         return;
@@ -341,10 +370,54 @@ void Show3dsStatusScreen(const char* title, const char* version) {
         TakeStdout(LoadingWrite);
     }
     // From here on the log goes only to the 3dslink host (if any) and the log file
+    LightLock_Init(&sPageLock);
+    LightLock_Lock(&sPageLock);
     sLoadingScreenUp = false;
     sStatusScreenUp = true;
-    ShowTitle(title, version);
-    ConsoleRow(kHintRow, "\x1b[2m", "START + SELECT to quit");
+    snprintf(sStatusTitle, sizeof(sStatusTitle), "%s", title);
+    snprintf(sStatusVersion, sizeof(sStatusVersion), "%s", version);
+    DrawStatusScreen();
+    LightLock_Unlock(&sPageLock);
+}
+
+void Set3dsBottomPage(bool gamePage) {
+    if (!sStatusScreenUp) {
+        return;
+    }
+    LightLock_Lock(&sPageLock);
+    if (gamePage != sGamePageUp) {
+        sGamePageUp = gamePage;
+        if (gamePage) {
+            ConsoleWrite("\x1b[2J");
+        } else {
+            DrawStatusScreen();
+        }
+    }
+    LightLock_Unlock(&sPageLock);
+}
+
+void Draw3dsBottomText(int column, int row, const char* text) {
+    if (!sStatusScreenUp) {
+        return;
+    }
+    char line[256];
+    snprintf(line, sizeof(line), "\x1b[%d;%dH%s\x1b[0m", row + 1, column + 1, text);
+    ConsoleWrite(line);
+}
+
+// The latest tap, noted by HandleEvents, which scans the buttons
+static bool sTapped = false;
+static int sTapColumn = 0;
+static int sTapRow = 0;
+
+bool Take3dsTap(int* column, int* row) {
+    if (!sTapped) {
+        return false;
+    }
+    sTapped = false;
+    *column = sTapColumn;
+    *row = sTapRow;
+    return true;
 }
 
 void Show3dsFatalError(const char* title, const char* message) {
@@ -408,17 +481,21 @@ void Show3dsFatalError(const char* title, const char* message) {
 }
 
 void Update3dsStatusLine(int index, const char* text) {
-    static char sShown[kStatusLineCount][48];
-    if (!sStatusScreenUp || index < 0 || index >= kStatusLineCount || strncmp(sShown[index], text, 47) == 0) {
+    if (!sStatusScreenUp || index < 0 || index >= kStatusLineCount ||
+        strncmp(sStatusShown[index], text, 47) == 0) {
         return;
     }
-    snprintf(sShown[index], sizeof(sShown[index]), "%s", text);
-    // A line starting with '*' is a heading
-    if (text[0] == '*') {
-        ConsoleRow(kFirstStatusLine + index, "\x1b[36;1m", text + 1);
-    } else {
-        ConsoleRow(kFirstStatusLine + index, "", text);
+    LightLock_Lock(&sPageLock);
+    snprintf(sStatusShown[index], sizeof(sStatusShown[index]), "%s", text);
+    if (!sGamePageUp) {
+        // A line starting with '*' is a heading
+        if (text[0] == '*') {
+            ConsoleRow(kFirstStatusLine + index, "\x1b[36;1m", text + 1);
+        } else {
+            ConsoleRow(kFirstStatusLine + index, "", text);
+        }
     }
+    LightLock_Unlock(&sPageLock);
 }
 
 void Update3dsStatusFps(float fps) {
@@ -426,18 +503,28 @@ void Update3dsStatusFps(float fps) {
     if (!sStatusScreenUp || rounded == sShownFps) {
         return;
     }
+    LightLock_Lock(&sPageLock);
     sShownFps = rounded;
-    char text[16];
-    snprintf(text, sizeof(text), "%d fps", rounded);
-    ConsoleRow(kFpsRow, "\x1b[32m", text);
+    if (!sGamePageUp) {
+        char text[16];
+        snprintf(text, sizeof(text), "%d fps", rounded);
+        ConsoleRow(kFpsRow, "\x1b[32m", text);
+    }
+    LightLock_Unlock(&sPageLock);
 }
 
 volatile uint64_t g3dsVBlankWaitTicks = 0;
 
 void Update3dsStatusNote(const char* text) {
-    if (sStatusScreenUp) {
+    if (!sStatusScreenUp) {
+        return;
+    }
+    LightLock_Lock(&sPageLock);
+    snprintf(sStatusNote, sizeof(sStatusNote), "%s", text);
+    if (!sGamePageUp) {
         ConsoleRow(kNoteRow, "\x1b[33m", text);
     }
+    LightLock_Unlock(&sPageLock);
 }
 
 void GfxWindowBackend3DS::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
@@ -534,6 +621,13 @@ void GfxWindowBackend3DS::HandleEvents() {
     // SDL scans the buttons in its 3DS video driver, which this backend does not use, so scan here.
     // SDL's joystick driver then reads the result in SDL_PumpEvents.
     hidScanInput();
+    if (hidKeysDown() & KEY_TOUCH) {
+        touchPosition touch;
+        hidTouchRead(&touch);
+        sTapColumn = std::clamp(touch.px / 8, 0, 39);
+        sTapRow = std::clamp(touch.py / 8, 0, 29);
+        sTapped = true;
+    }
     SDL_PumpEvents();
     // The SDL backend drains the queue each frame, and the headless GUI never runs the element
     // that connects gamepads, so do both here: connect the 3DS's own buttons, drop the rest.

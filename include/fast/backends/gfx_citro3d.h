@@ -228,7 +228,6 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     // a single image. The second eye reuses the first eye's vertices.
     void Replay(FrameRecord& frame, C3D_RenderTarget_tag* target, int eyeSign, bool secondEye);
     void ApplyEyeShift(const float* firstVertex, bool sampledFramebuffer);
-    void UpdateStereoTuning();
     void PromoteTextures();
     void ForgetTexObject(void* tex);
     void FinishFrame(FrameRecord& frame);
@@ -313,9 +312,6 @@ class GfxRenderingAPICitro3D final : public GfxRenderingAPI {
     // testing are the HUD, pause menu included, which the game draws in perspective
     size_t mHudFromOp = 0;
     size_t mOpIndex = 0;
-    float mConvergence = 384.0f; // the distance, in w, that stays at the screen's depth
-    float mHudDepth = -0.5f;      // the HUD's depth, as a share of the farthest shift (+ is into the screen)
-    bool mTouchHeld = false;
     EyeStartState mEyeStart = {};
     uint32_t mWorldDepths[8] = {}; // world draws by the first vertex's w, in doubling bands from 100
     FilteringMode mFilterMode = FILTER_LINEAR;

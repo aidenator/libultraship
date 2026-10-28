@@ -45,6 +45,16 @@ void Set3dsSceneConvergence(float convergence) {
     sSceneConvergence.store(convergence, std::memory_order_relaxed);
 }
 
+// The player's 3D settings (see Set3dsStereoDepth): the distance, in w, that stays at the screen's
+// depth, and the HUD's depth as a share of the farthest shift (+ is into the screen)
+static std::atomic<float> sConvergence{ 384.0f };
+static std::atomic<float> sHudDepth{ -0.5f };
+
+void Set3dsStereoDepth(float convergence, float hudDepth) {
+    sConvergence.store(convergence, std::memory_order_relaxed);
+    sHudDepth.store(hudDepth, std::memory_order_relaxed);
+}
+
 using namespace Citro3D;
 
 // Texture decoding in the interpreter (interpreter.cpp), for the slow-frame report
@@ -1740,45 +1750,14 @@ void GfxRenderingAPICitro3D::ApplyEyeShift(const float* firstVertex, bool sample
     const float shift = -(float)mEyeSign * mEyeShift;
     if (kind == 2 || kind == 3) {
         const float scene = sSceneConvergence.load(std::memory_order_relaxed);
-        const float convergence = kind == 3 ? kOwnCameraConvergence : (scene > 0.0f ? scene : mConvergence);
+        const float convergence =
+            kind == 3 ? kOwnCameraConvergence : (scene > 0.0f ? scene : sConvergence.load(std::memory_order_relaxed));
         C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, shift, -convergence, -kPopOutCap, 0.0f);
     } else if (kind == 1) {
-        C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, 0.0f, 0.0f, 0.0f, shift * mHudDepth);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, 0.0f, 0.0f, 0.0f, shift * sHudDepth.load(std::memory_order_relaxed));
     } else {
         C3D_FVUnifSet(GPU_VERTEX_SHADER, mStereoUniform, 0.0f, 0.0f, 0.0f, 0.0f);
     }
-}
-
-void GfxRenderingAPICitro3D::UpdateStereoTuning() {
-    // A hidden tuning control for 3D: hold SELECT and tap the bottom screen's top half to move the
-    // convergence distance (left nearer, right farther), or its bottom half to move the HUD (left
-    // out, right in)
-    const bool held = (hidKeysHeld() & (KEY_TOUCH | KEY_SELECT)) == (KEY_TOUCH | KEY_SELECT);
-    const bool tapped = held && !mTouchHeld;
-    mTouchHeld = held;
-    if (!tapped) {
-        return;
-    }
-    touchPosition touch;
-    hidTouchRead(&touch);
-    const bool right = touch.px >= 160;
-    // A scene with its own convergence tunes that one
-    const float scene = sSceneConvergence.load(std::memory_order_relaxed);
-    float convergence = scene > 0.0f ? scene : mConvergence;
-    if (touch.py < 120) {
-        convergence = std::clamp(convergence * (right ? 1.25f : 0.8f), 25.0f, 20000.0f);
-        if (scene > 0.0f) {
-            sSceneConvergence.store(convergence, std::memory_order_relaxed);
-        } else {
-            mConvergence = convergence;
-        }
-    } else {
-        mHudDepth = std::clamp(mHudDepth + (right ? 0.25f : -0.25f), -2.0f, 2.0f);
-    }
-    char note[48];
-    snprintf(note, sizeof(note), "3D: convergence %.0f, HUD %+.2f", convergence, mHudDepth);
-    printf("%s\n", note);
-    Update3dsStatusNote(note);
 }
 
 void GfxRenderingAPICitro3D::PromoteTextures() {
@@ -1946,7 +1925,6 @@ void GfxRenderingAPICitro3D::FinishFrame(FrameRecord& frame) {
                              (u32)bottomWidth * bottomHeight * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_BOTTOM)));
     C3D_FrameEnd(GX_CMDLIST_FLUSH);
     UpdateGpuTest();
-    UpdateStereoTuning();
 
     mFrameCount++;
     const uint64_t now = svcGetSystemTick();
@@ -2029,7 +2007,7 @@ void GfxRenderingAPICitro3D::FinishFrame(FrameRecord& frame) {
         const float scene = sSceneConvergence.load(std::memory_order_relaxed);
         printf("  3D: shift %.3f, convergence %.0f, HUD %+.2f; world draws by w: <100 %lu, <200 %lu, <400 %lu, "
                "<800 %lu, <1600 %lu, <3200 %lu, <6400 %lu, more %lu\n",
-               frame.eyeShift, scene > 0.0f ? scene : mConvergence, mHudDepth, (unsigned long)d[0], (unsigned long)d[1],
+               frame.eyeShift, scene > 0.0f ? scene : sConvergence.load(), sHudDepth.load(), (unsigned long)d[0], (unsigned long)d[1],
                (unsigned long)d[2], (unsigned long)d[3], (unsigned long)d[4], (unsigned long)d[5],
                (unsigned long)d[6], (unsigned long)d[7]);
         memset(mWorldDepths, 0, sizeof(mWorldDepths));
