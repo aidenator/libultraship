@@ -437,11 +437,17 @@ size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
     // the mutex.
     std::variant<ResourceLoadError, std::shared_ptr<IResource>> value = nullptr;
     size_t ret = 0;
-    // We can only erase the resource if we have any resources for that owner.
-    if (mResourceCache.contains(identifier)) {
+    {
+        // The lookup too: another thread may be adding to the cache, which can rehash it
         const std::lock_guard<std::mutex> lock(mMutex);
-        mResourceCache.erase(identifier);
+        auto found = mResourceCache.find(identifier);
+        if (found != mResourceCache.end()) {
+            value = std::move(found->second);
+            mResourceCache.erase(found);
+            ret = 1;
+        }
     }
+    // value goes here, with the lock released
 
     return ret;
 }
