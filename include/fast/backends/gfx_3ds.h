@@ -29,6 +29,13 @@ bool Is3dsNew();
  */
 void Show3dsLoadingScreen(const char* title, const char* version);
 
+/// Whether the system asked the app to close (from the HOME Menu), rather than the player quitting
+bool Is3dsSystemClose();
+
+/// Ends the app at once after a system close, skipping the shutdown that would wait on the GPU and
+/// sound the suspended app no longer has. Save what matters first.
+[[noreturn]] void Exit3dsForSystemClose();
+
 /// Moves the loading bar to fraction (0 to 1) and names the step under way; also logs the time
 void Set3dsLoadProgress(float fraction, const char* step);
 

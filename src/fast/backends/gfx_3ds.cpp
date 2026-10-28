@@ -3,6 +3,7 @@
 #include "fast/backends/gfx_3ds.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <malloc.h>
@@ -112,6 +113,30 @@ bool Is3dsNew() {
     APT_CheckNew3DS(&isNew3ds);
     return isNew3ds;
 #endif
+}
+
+// Set when the system asks the app to close (another app opened from the HOME Menu while the game
+// was suspended), rather than the player quitting
+static std::atomic<bool> sSystemClose{ false };
+
+bool Is3dsSystemClose() {
+    return sSystemClose.load();
+}
+
+extern "C" void (*__system_retAddr)(void);
+
+void Exit3dsForSystemClose() {
+    // The app is suspended: the HOME Menu has the GPU and sound is asleep, so the normal shutdown
+    // waits for good on a frame that can't finish. Do only what the system needs from libctru's
+    // own exit: tell it the app is closing (aptExit, which leaves the close confirmation in
+    // __system_retAddr), confirm, and end the process, which stops every thread at once. Nothing
+    // is freed first: the other threads still run on stacks in the heap.
+    aptExit();
+    if (__system_retAddr != nullptr) {
+        __system_retAddr();
+    }
+    svcExitProcess();
+    __builtin_unreachable();
 }
 
 void Join3dsThread(void* thread) {
@@ -504,6 +529,7 @@ void GfxWindowBackend3DS::HandleEvents() {
     if (!aptMainLoop() && mIsRunning) {
         printf("System requested exit\n");
         mIsRunning = false;
+        sSystemClose = true;
     }
     // SDL scans the buttons in its 3DS video driver, which this backend does not use, so scan here.
     // SDL's joystick driver then reads the result in SDL_PumpEvents.
